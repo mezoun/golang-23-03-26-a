@@ -4,5 +4,6 @@ a/node_modules/
 .curl-ai-cf
 .curl-guide.md
 .curl-create.md
+.curl-create-*.md
 doc-0.md
 doc-1.md

@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 )
@@ -171,10 +172,17 @@ func (s *Store) List() []*Worker {
 //    This map is mutable at runtime: register/unregister freely.
 // ─────────────────────────────────────────────
 
+// pipelineCtx carries data produced by one step for consumption by later steps.
+// Currently populated by the webhook step with the incoming request body.
+type pipelineCtx struct {
+	Body    map[string]interface{} // parsed JSON body from webhook
+	Headers map[string]string      // incoming request headers
+}
+
 type hookEntry struct {
 	method   string
 	workerID string
-	arrived  chan struct{}
+	arrived  chan pipelineCtx // delivers parsed webhook payload to the worker goroutine
 }
 
 type webhookRouter struct {
@@ -186,7 +194,7 @@ func newWebhookRouter() *webhookRouter {
 	return &webhookRouter{entries: make(map[string]*hookEntry)}
 }
 
-func (wr *webhookRouter) register(path, method, workerID string, arrived chan struct{}) {
+func (wr *webhookRouter) register(path, method, workerID string, arrived chan pipelineCtx) {
 	wr.mu.Lock()
 	defer wr.mu.Unlock()
 	wr.entries[path] = &hookEntry{method: method, workerID: workerID, arrived: arrived}
@@ -218,11 +226,22 @@ func (wr *webhookRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	log.Printf("[worker:%s] WEBHOOK %s %s | body: %s",
 		entry.workerID, r.Method, r.URL.Path, string(body))
+
+	// parse body into pipeline context
+	pctx := pipelineCtx{
+		Body:    make(map[string]interface{}),
+		Headers: make(map[string]string),
+	}
+	_ = json.Unmarshal(body, &pctx.Body)
+	for k := range r.Header {
+		pctx.Headers[k] = r.Header.Get(k)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, `{"status":"received"}`)
 	select {
-	case entry.arrived <- struct{}{}:
+	case entry.arrived <- pctx:
 	default:
 	}
 }
@@ -306,6 +325,7 @@ func (rt *Runtime) IsRunning(id string) bool {
 
 func runWorker(ctx context.Context, w *Worker, _ *Store, hooks *webhookRouter) {
 	log.Printf("[worker:%s] started — %s", w.ID, w.Name)
+	pctx := pipelineCtx{Body: make(map[string]interface{}), Headers: make(map[string]string)}
 	for _, step := range w.Steps {
 		select {
 		case <-ctx.Done():
@@ -316,15 +336,16 @@ func runWorker(ctx context.Context, w *Worker, _ *Store, hooks *webhookRouter) {
 		switch step.Type {
 		case "webhook":
 			if step.Webhook != nil {
-				execWebhook(ctx, w.ID, step.Webhook, hooks)
+				pctx = execWebhook(ctx, w.ID, step.Webhook, hooks)
 			}
 		case "log":
 			if step.Log != nil {
-				log.Printf("[worker:%s] LOG → %s", w.ID, step.Log.Message)
+				msg := renderTemplate(step.Log.Message, pctx)
+				log.Printf("[worker:%s] LOG → %s", w.ID, msg)
 			}
 		case "call_api":
 			if step.CallAPI != nil {
-				execCallAPI(ctx, w.ID, step.CallAPI)
+				execCallAPI(ctx, w.ID, step.CallAPI, pctx)
 			}
 		default:
 			log.Printf("[worker:%s] unknown step type: %q", w.ID, step.Type)
@@ -337,30 +358,82 @@ func runWorker(ctx context.Context, w *Worker, _ *Store, hooks *webhookRouter) {
 //  Step executors
 // ─────────────────────────────────────────────
 
-func execWebhook(ctx context.Context, workerID string, cfg *WebhookStep, hooks *webhookRouter) {
+// ─────────────────────────────────────────────
+//  Template rendering
+//  Syntax: {{.field}}       → top-level field from webhook body
+//          {{.field.sub}}   → nested field
+//  Unknown keys render as empty string (silent).
+// ─────────────────────────────────────────────
+
+func renderTemplate(s string, pctx pipelineCtx) string {
+	if !strings.Contains(s, "{{") {
+		return s // fast path — nothing to replace
+	}
+	result := s
+	for strings.Contains(result, "{{.") {
+		start := strings.Index(result, "{{.")
+		end := strings.Index(result[start:], "}}")
+		if end == -1 {
+			break
+		}
+		end += start
+		placeholder := result[start : end+2]            // e.g. "{{.sys}}"
+		key := strings.TrimSpace(result[start+3 : end]) // e.g. "sys"
+
+		value := resolveKey(key, pctx.Body)
+		result = strings.Replace(result, placeholder, fmt.Sprintf("%v", value), 1)
+	}
+	return result
+}
+
+// resolveKey supports dot-notation: "user.name" → body["user"]["name"]
+func resolveKey(key string, data map[string]interface{}) interface{} {
+	parts := strings.SplitN(key, ".", 2)
+	val, ok := data[parts[0]]
+	if !ok {
+		return ""
+	}
+	if len(parts) == 1 {
+		return val
+	}
+	// recurse into nested map
+	if nested, ok := val.(map[string]interface{}); ok {
+		return resolveKey(parts[1], nested)
+	}
+	return ""
+}
+
+func execWebhook(ctx context.Context, workerID string, cfg *WebhookStep, hooks *webhookRouter) pipelineCtx {
 	// Full path: /<workerID><path>
 	// e.g. workerID=a3f2c1d4, path=/hook/order -> /a3f2c1d4.../hook/order
 	// Guarantees no clash between workers sharing the same path string.
 	fullPath := "/" + workerID + cfg.Path
 
-	arrived := make(chan struct{}, 1)
+	arrived := make(chan pipelineCtx, 1)
 	hooks.register(fullPath, string(cfg.Method), workerID, arrived)
 	defer hooks.unregister(fullPath)
 
 	select {
-	case <-arrived:
+	case pctx := <-arrived:
 		log.Printf("[worker:%s] WEBHOOK triggered, continuing workflow", workerID)
+		return pctx
 	case <-ctx.Done():
 		log.Printf("[worker:%s] WEBHOOK cancelled", workerID)
+		return pipelineCtx{Body: make(map[string]interface{}), Headers: make(map[string]string)}
 	}
 }
 
-func execCallAPI(ctx context.Context, workerID string, cfg *CallAPIStep) {
+func execCallAPI(ctx context.Context, workerID string, cfg *CallAPIStep, pctx pipelineCtx) {
+	// render URL
+	renderedURL := renderTemplate(cfg.URL, pctx)
+
+	// render body: replace {{.field}} inside raw JSON string
 	var reqBody io.Reader
 	if len(cfg.Body) > 0 {
-		reqBody = bytes.NewReader(cfg.Body)
+		renderedBody := renderTemplate(string(cfg.Body), pctx)
+		reqBody = bytes.NewReader([]byte(renderedBody))
 	}
-	req, err := http.NewRequestWithContext(ctx, string(cfg.Method), cfg.URL, reqBody)
+	req, err := http.NewRequestWithContext(ctx, string(cfg.Method), renderedURL, reqBody)
 	if err != nil {
 		log.Printf("[worker:%s] CALL_API build error: %v", workerID, err)
 		return
@@ -369,7 +442,7 @@ func execCallAPI(ctx context.Context, workerID string, cfg *CallAPIStep) {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	for k, v := range cfg.Headers {
-		req.Header.Set(k, v)
+		req.Header.Set(k, renderTemplate(v, pctx))
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

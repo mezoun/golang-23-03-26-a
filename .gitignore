@@ -5,5 +5,6 @@ a/node_modules/
 .curl-guide.md
 .curl-create.md
 .curl-create-*.md
-doc-0.md
-doc-1.md
+.rencana
+doc-*.md
+README-*.md

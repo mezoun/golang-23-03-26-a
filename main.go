@@ -38,10 +38,10 @@ type LogStep struct {
 }
 
 type CallAPIStep struct {
-	Method  HTTPMethod             `json:"method"`
-	URL     string                 `json:"url"`
-	Headers map[string]string      `json:"headers,omitempty"`
-	Body    map[string]interface{} `json:"body,omitempty"`
+	Method  HTTPMethod        `json:"method"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Body    json.RawMessage   `json:"body,omitempty"`
 }
 
 type Step struct {
@@ -51,13 +51,25 @@ type Step struct {
 	CallAPI *CallAPIStep `json:"call_api,omitempty"`
 }
 
+// WorkerMode controls how a worker behaves after completing all steps.
+//
+//	"once" — run once then stop (default)
+//	"loop" — restart automatically after each completion, forever
+type WorkerMode string
+
+const (
+	ModeOnce WorkerMode = "once"
+	ModeLoop WorkerMode = "loop"
+)
+
 type Worker struct {
-	ID      string    `json:"id"`
-	Name    string    `json:"name"`
-	Steps   []Step    `json:"steps"`
-	Running bool      `json:"running"`
-	Created time.Time `json:"created"`
-	Updated time.Time `json:"updated"`
+	ID      string     `json:"id"`
+	Name    string     `json:"name"`
+	Mode    WorkerMode `json:"mode"` // "once" | "loop"
+	Steps   []Step     `json:"steps"`
+	Running bool       `json:"running"`
+	Created time.Time  `json:"created"`
+	Updated time.Time  `json:"updated"`
 }
 
 // ─────────────────────────────────────────────
@@ -234,9 +246,46 @@ func (rt *Runtime) Start(w *Worker, store *Store, hooks *webhookRouter) {
 	if _, running := rt.cancels[w.ID]; running {
 		return
 	}
+	mode := w.Mode
+	if mode == "" {
+		mode = ModeOnce
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	rt.cancels[w.ID] = cancel
-	go runWorker(ctx, w, store, hooks)
+	go func() {
+		for {
+			runWorker(ctx, w, store, hooks)
+			// check if cancelled (Stop was called)
+			select {
+			case <-ctx.Done():
+				// stopped manually — update Running=false in store
+				if wk, ok := store.Get(w.ID); ok {
+					wk.Running = false
+					wk.Updated = time.Now()
+					_ = store.Save(wk)
+				}
+				rt.mu.Lock()
+				delete(rt.cancels, w.ID)
+				rt.mu.Unlock()
+				return
+			default:
+			}
+			if mode == ModeLoop {
+				log.Printf("[worker:%s] mode=loop, restarting...", w.ID)
+				continue
+			}
+			// once: completed naturally — update Running=false in store
+			if wk, ok := store.Get(w.ID); ok {
+				wk.Running = false
+				wk.Updated = time.Now()
+				_ = store.Save(wk)
+			}
+			rt.mu.Lock()
+			delete(rt.cancels, w.ID)
+			rt.mu.Unlock()
+			return
+		}
+	}()
 }
 
 func (rt *Runtime) Stop(id string) {
@@ -308,16 +357,15 @@ func execWebhook(ctx context.Context, workerID string, cfg *WebhookStep, hooks *
 
 func execCallAPI(ctx context.Context, workerID string, cfg *CallAPIStep) {
 	var reqBody io.Reader
-	if cfg.Method == MethodPOST && len(cfg.Body) > 0 {
-		b, _ := json.Marshal(cfg.Body)
-		reqBody = bytes.NewReader(b)
+	if len(cfg.Body) > 0 {
+		reqBody = bytes.NewReader(cfg.Body)
 	}
 	req, err := http.NewRequestWithContext(ctx, string(cfg.Method), cfg.URL, reqBody)
 	if err != nil {
 		log.Printf("[worker:%s] CALL_API build error: %v", workerID, err)
 		return
 	}
-	if cfg.Method == MethodPOST {
+	if len(cfg.Body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	for k, v := range cfg.Headers {
@@ -386,6 +434,9 @@ func (a *App) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if err := a.store.Save(&worker); err != nil {
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if worker.Mode == "" {
+		worker.Mode = ModeOnce
 	}
 	if worker.Running {
 		a.runtime.Start(&worker, a.store, a.hooks)
@@ -475,14 +526,14 @@ func (a *App) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if a.runtime.IsRunning(id) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "already running"})
+		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "already running", "mode": worker.Mode})
 		return
 	}
 	worker.Running = true
 	worker.Updated = time.Now()
 	_ = a.store.Save(worker)
 	a.runtime.Start(worker, a.store, a.hooks)
-	writeJSON(w, http.StatusOK, map[string]string{"status": "started"})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"status": "started", "mode": worker.Mode})
 }
 
 // POST /stop?id=<id>

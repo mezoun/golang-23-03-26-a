@@ -8,3 +8,4 @@ a/node_modules/
 .rencana-*.md
 doc-*.md
 README-*.md
+.notes*

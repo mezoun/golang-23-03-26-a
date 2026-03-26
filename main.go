@@ -235,6 +235,7 @@ type Store struct {
 	dirty int32 // atomic bool: 0=clean, 1=dirty
 	wake  chan struct{}
 	done  chan struct{} // sinyal shutdown untuk flusher
+	wg    sync.WaitGroup
 }
 
 func openStore() (*Store, error) {
@@ -246,6 +247,7 @@ func openStore() (*Store, error) {
 	f, err := os.Open(storeFile)
 	if err != nil {
 		if os.IsNotExist(err) {
+			s.wg.Add(1)
 			go s.flusher()
 			return s, nil
 		}
@@ -270,11 +272,13 @@ func openStore() (*Store, error) {
 		delete(s.data, id)
 	}
 	atomic.StoreInt64(&s.count, int64(len(s.data)))
+	s.wg.Add(1)
 	go s.flusher()
 	return s, nil
 }
 
 func (s *Store) flusher() {
+	defer s.wg.Done()
 	for {
 		select {
 		case <-s.done:
@@ -316,9 +320,10 @@ func (s *Store) markDirty() {
 	}
 }
 
-// shutdown menutup flusher dengan graceful flush terakhir.
+// shutdown menutup flusher dengan graceful flush terakhir dan menunggu flusher selesai.
 func (s *Store) shutdown() {
 	close(s.done)
+	s.wg.Wait()
 }
 
 func (s *Store) flushNow() error {
@@ -743,6 +748,13 @@ func (rt *Runtime) IsRunning(id string) bool {
 	return ok
 }
 
+// deleteStatus menghapus status worker dari memori — dipanggil saat worker didelete.
+func (rt *Runtime) deleteStatus(id string) {
+	rt.mu.Lock()
+	delete(rt.statuses, id)
+	rt.mu.Unlock()
+}
+
 // ─────────────────────────────────────────────
 //  runWorker — index-based traversal + goto
 //  Return: error string (kosong = sukses)
@@ -837,9 +849,15 @@ func runWorker(
 		case "sleep":
 			execSleep(ctx, w.ID, step, *pctx, vars)
 			pctx.store(step.ID, map[string]interface{}{"done": true})
+			if step.parsedOutput != nil {
+				pctx.store(step.ID, renderOutputParsed(step.parsedOutput, *pctx, vars))
+			}
 
 		case "set_var":
 			execSetVar(w.ID, step, pctx, vars)
+			if step.parsedOutput != nil {
+				pctx.store(step.ID, renderOutputParsed(step.parsedOutput, *pctx, vars))
+			}
 
 		default:
 			log.Printf("[worker:%s][step:%s] unknown type: %q", w.ID, step.stepLabel(), step.Type)
@@ -1126,10 +1144,6 @@ func execSleep(ctx context.Context, workerID string, step Step, pctx pipelineCtx
 	if cfg.SleepSeconds > 0 {
 		ms = cfg.SleepSeconds * 1000
 	}
-	// render template jika mengandung {{}}
-	if ms == 0 && strings.Contains(cfg.Message, "{{") {
-		// fallback ke 0
-	}
 	if ms > maxSleepMs {
 		ms = maxSleepMs
 	}
@@ -1371,9 +1385,17 @@ type App struct {
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		log.Printf("writeJSON: encode error: %v", err)
+		http.Error(w, `{"error":"internal encode error"}`, http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
+	if _, err := w.Write(b); err != nil {
+		log.Printf("writeJSON: write error: %v", err)
+	}
 }
 
 func errJSON(w http.ResponseWriter, code int, msg string) {
@@ -1545,9 +1567,12 @@ func (a *App) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 	// Ganti DeepEqual dengan FNV hash — lebih cepat dan akurat untuk RawMessage
 	wasRunning := a.runtime.IsRunning(updated.ID)
-	if wasRunning && stepsHash(existing.Steps) != stepsHash(updated.Steps) {
-		a.runtime.Stop(updated.ID)
-		wasRunning = false
+	if wasRunning {
+		// Stop jika: (a) caller meminta berhenti, atau (b) steps berubah
+		if !updated.Running || stepsHash(existing.Steps) != stepsHash(updated.Steps) {
+			a.runtime.Stop(updated.ID)
+			wasRunning = false
+		}
 	}
 	assignStepIDs(updated.Steps)
 	a.store.Save(&updated)
@@ -1576,6 +1601,7 @@ func (a *App) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.runtime.Stop(id)
+	a.runtime.deleteStatus(id)
 	a.store.Delete(id)
 	writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
 }
@@ -1674,11 +1700,12 @@ func main() {
 
 	addr := ":8080"
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      mux,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	// FASE 0-B: Graceful shutdown
@@ -1705,10 +1732,8 @@ func main() {
 		log.Printf("server shutdown error: %v", err)
 	}
 
-	// Flush terakhir store
+	// Flush terakhir store — blocking sampai flusher benar-benar selesai
 	store.shutdown()
-	// Tunggu sebentar agar flusher selesai
-	time.Sleep(500 * time.Millisecond)
 
 	log.Println("worker-engine exited cleanly")
 }

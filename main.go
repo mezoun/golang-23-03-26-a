@@ -7,19 +7,79 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
+	mrand "math/rand"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
-	"reflect"
-	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
+
+// ─────────────────────────────────────────────
+//  Init — gob type registration (WAJIB untuk
+//  encode/decode interface{} nested types)
+// ─────────────────────────────────────────────
+
+func init() {
+	gob.Register(map[string]interface{}{})
+	gob.Register([]interface{}{})
+	gob.Register(map[string]string{})
+	gob.Register(float64(0))
+	gob.Register(bool(false))
+	gob.Register("")
+}
+
+// ─────────────────────────────────────────────
+//  Konstanta sistem — ubah sesuai kebutuhan
+// ─────────────────────────────────────────────
+
+const (
+	// Batas multi-tenant
+	maxConcurrentWorkers = 50  // max worker aktif bersamaan
+	maxStoredWorkers     = 500 // max worker tersimpan di store
+	maxStepsPerWorker    = 100 // max steps per worker
+	maxConcurrentCalls   = 20  // max concurrent call_api simultan
+	maxVarsBuckets       = 20  // max bucket dalam vars
+	maxVarsPerBucket     = 50  // max key per bucket
+
+	// Body size limit
+	maxBodyBytes    = 128 << 10 // 128 KB — untuk /create, /update
+	maxWebhookBytes = 64 << 10  // 64 KB — untuk webhook body
+
+	// Retry
+	maxRetryCount = 5
+
+	// Sleep step
+	maxSleepMs = 60_000 // 60 detik
+
+	// Loop interval
+	defaultLoopIntervalMs = 500 // 500ms default
+	minLoopIntervalMs     = 200 // 200ms minimum
+
+	// Storage
+	storeFile   = "workers.gob"
+	flushWindow = 300 * time.Millisecond
+
+	// Staggered start saat boot
+	staggerMinMs = 10
+	staggerMaxMs = 40
+
+	// Jump limit per run (proteksi infinite loop)
+	jumpLimit = 1000
+)
+
+// Global semaphore untuk concurrent call_api
+var callAPISem = make(chan struct{}, maxConcurrentCalls)
 
 // ─────────────────────────────────────────────
 //  Domain types
@@ -32,12 +92,21 @@ const (
 	MethodPOST HTTPMethod = "POST"
 )
 
+// RetryConfig konfigurasi retry untuk call_api.
+type RetryConfig struct {
+	Max     int  `json:"max"`      // max percobaan ulang (dikunci maxRetryCount)
+	DelayMs int  `json:"delay_ms"` // delay awal antar retry (ms)
+	Backoff bool `json:"backoff"`  // exponential backoff jika true
+}
+
 // StepValue holds config for each step type.
 //
 //	log      → { "message": "..." }
 //	webhook  → { "method": "POST", "path": "/hook" }
-//	call_api → { "method": "POST", "url": "...", "headers": {}, "body": {} }
+//	call_api → { "method": "POST", "url": "...", "headers": {}, "body": {}, "retry": {...} }
 //	branch   → { "cases": [...] }
+//	sleep    → { "sleep_ms": 500 } atau { "sleep_seconds": 2 }
+//	set_var  → { "set_key": "nama_field", "set_value": "{{step.field}}" }
 type StepValue struct {
 	// log
 	Message string `json:"message,omitempty"`
@@ -52,17 +121,18 @@ type StepValue struct {
 	URL     string            `json:"url,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
 	Body    json.RawMessage   `json:"body,omitempty"`
+	Retry   *RetryConfig      `json:"retry,omitempty"`
 
 	// branch
-	// Cases dievaluasi berurutan — cocok pertama menang (if / elseif / else).
-	// Case tanpa "when" (atau when nil) = else, selalu cocok.
-	//
-	//   "when": { "left": "{{step.field}}", "op": "==", "right": "Pizza" }
-	//   "goto": "target_step_id"   ← lompat ke step ini jika cocok
-	//                                 kosong = lanjut sequential
-	//
-	// Op: ==  !=  >  <  >=  <=  contains  starts_with  ends_with
 	Cases []BranchCase `json:"cases,omitempty"`
+
+	// sleep
+	SleepMs      int `json:"sleep_ms,omitempty"`
+	SleepSeconds int `json:"sleep_seconds,omitempty"`
+
+	// set_var
+	SetKey   string `json:"set_key,omitempty"`
+	SetValue string `json:"set_value,omitempty"`
 }
 
 // BranchCase adalah satu cabang dalam step branch.
@@ -72,7 +142,6 @@ type BranchCase struct {
 }
 
 // Condition adalah satu ekspresi perbandingan.
-// Left dan Right mendukung template {{...}}.
 type Condition struct {
 	Left  string `json:"left"`
 	Op    string `json:"op"`
@@ -80,16 +149,13 @@ type Condition struct {
 }
 
 // Step adalah satu unit kerja dalam workflow.
-//
-// Next (opsional) — paksa lompat ke step ID ini setelah eksekusi step ini,
-// tanpa perlu branch. Berguna untuk skip block atau custom flow.
 type Step struct {
 	ID     string          `json:"id"`
 	Name   string          `json:"name,omitempty"`
-	Type   string          `json:"type"` // "log" | "webhook" | "call_api" | "branch"
+	Type   string          `json:"type"`
 	Value  *StepValue      `json:"value"`
 	Output json.RawMessage `json:"output,omitempty"`
-	Next   string          `json:"next,omitempty"` // opsional: paksa goto step ID ini
+	Next   string          `json:"next,omitempty"`
 
 	// runtime — tidak diserialisasi
 	parsedOutput interface{}
@@ -103,18 +169,43 @@ const (
 )
 
 type Worker struct {
-	ID      string                       `json:"id"`
-	Name    string                       `json:"name"`
-	Mode    WorkerMode                   `json:"mode"`
-	Vars    map[string]map[string]string `json:"vars,omitempty"`
-	Steps   []Step                       `json:"steps"`
-	Running bool                         `json:"running"`
-	Created time.Time                    `json:"created"`
-	Updated time.Time                    `json:"updated"`
+	ID             string                       `json:"id"`
+	Name           string                       `json:"name"`
+	Mode           WorkerMode                   `json:"mode"`
+	Vars           map[string]map[string]string `json:"vars,omitempty"`
+	Steps          []Step                       `json:"steps"`
+	Running        bool                         `json:"running"`
+	LoopIntervalMs int                          `json:"loop_interval_ms,omitempty"`
+	Created        time.Time                    `json:"created"`
+	Updated        time.Time                    `json:"updated"`
 }
 
-// prepareSteps pre-parses Output JSON dan membangun stepID→index map.
-// Dipanggil sekali saat worker start — tidak diulang setiap loop iterasi.
+// loopDelay mengembalikan interval loop yang aman.
+func (w *Worker) loopDelay() time.Duration {
+	ms := w.LoopIntervalMs
+	if ms < minLoopIntervalMs {
+		ms = defaultLoopIntervalMs
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// ─────────────────────────────────────────────
+//  WorkerStatus — runtime info, in-memory only
+// ─────────────────────────────────────────────
+
+type WorkerStatus struct {
+	ID        string    `json:"id"`
+	Running   bool      `json:"running"`
+	LastRunAt time.Time `json:"last_run_at,omitempty"`
+	LastRunOk bool      `json:"last_run_ok"`
+	LastError string    `json:"last_error,omitempty"`
+	RunCount  int64     `json:"run_count"`
+}
+
+// ─────────────────────────────────────────────
+//  prepareSteps
+// ─────────────────────────────────────────────
+
 func prepareSteps(steps []Step) ([]Step, map[string]int) {
 	out := make([]Step, len(steps))
 	copy(out, steps)
@@ -137,22 +228,20 @@ func prepareSteps(steps []Step) ([]Step, map[string]int) {
 //  Storage — gob + async debounced flush
 // ─────────────────────────────────────────────
 
-const (
-	storeFile   = "workers.gob"
-	flushWindow = 300 * time.Millisecond
-)
-
 type Store struct {
 	mu    sync.RWMutex
 	data  map[string]*Worker
-	dirty atomic.Bool
+	count int64 // atomic via atomic.AddInt64/LoadInt64
+	dirty int32 // atomic bool: 0=clean, 1=dirty
 	wake  chan struct{}
+	done  chan struct{} // sinyal shutdown untuk flusher
 }
 
 func openStore() (*Store, error) {
 	s := &Store{
 		data: make(map[string]*Worker),
 		wake: make(chan struct{}, 1),
+		done: make(chan struct{}),
 	}
 	f, err := os.Open(storeFile)
 	if err != nil {
@@ -180,12 +269,25 @@ func openStore() (*Store, error) {
 		log.Printf("migrate: dropping worker %s — old step schema (re-create it)", id)
 		delete(s.data, id)
 	}
+	atomic.StoreInt64(&s.count, int64(len(s.data)))
 	go s.flusher()
 	return s, nil
 }
 
 func (s *Store) flusher() {
-	for range s.wake {
+	for {
+		select {
+		case <-s.done:
+			// Shutdown — flush terakhir
+			if atomic.LoadInt32(&s.dirty) == 1 {
+				if err := s.flushNow(); err != nil {
+					log.Printf("store: final flush error: %v", err)
+				}
+			}
+			return
+		case <-s.wake:
+		}
+		// Debounce: drain semua wake yang menumpuk
 		time.Sleep(flushWindow)
 		for {
 			select {
@@ -195,31 +297,42 @@ func (s *Store) flusher() {
 			}
 		}
 	flush:
-		if !s.dirty.Load() {
+		if atomic.LoadInt32(&s.dirty) == 0 {
 			continue
 		}
 		if err := s.flushNow(); err != nil {
 			log.Printf("store: flush error: %v", err)
 		} else {
-			s.dirty.Store(false)
+			atomic.StoreInt32(&s.dirty, 0)
 		}
 	}
 }
 
 func (s *Store) markDirty() {
-	s.dirty.Store(true)
+	atomic.StoreInt32(&s.dirty, 1)
 	select {
 	case s.wake <- struct{}{}:
 	default:
 	}
 }
 
+// shutdown menutup flusher dengan graceful flush terakhir.
+func (s *Store) shutdown() {
+	close(s.done)
+}
+
 func (s *Store) flushNow() error {
+	// Buat snapshot map dulu, baru lepas lock — encode di luar lock
 	s.mu.RLock()
-	var buf bytes.Buffer
-	err := gob.NewEncoder(&buf).Encode(s.data)
+	snapshot := make(map[string]*Worker, len(s.data))
+	for k, v := range s.data {
+		cp := *v
+		snapshot[k] = &cp
+	}
 	s.mu.RUnlock()
-	if err != nil {
+
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(snapshot); err != nil {
 		return err
 	}
 	dir := filepath.Dir(storeFile)
@@ -247,23 +360,35 @@ func (s *Store) flushNow() error {
 
 func (s *Store) Save(w *Worker) {
 	s.mu.Lock()
-	s.data[w.ID] = w
+	_, exists := s.data[w.ID]
+	cp := *w
+	s.data[w.ID] = &cp
+	if !exists {
+		atomic.AddInt64(&s.count, 1)
+	}
 	s.mu.Unlock()
 	s.markDirty()
 }
 
 func (s *Store) Delete(id string) {
 	s.mu.Lock()
-	delete(s.data, id)
+	if _, ok := s.data[id]; ok {
+		delete(s.data, id)
+		atomic.AddInt64(&s.count, -1)
+	}
 	s.mu.Unlock()
 	s.markDirty()
 }
 
-func (s *Store) Get(id string) (*Worker, bool) {
+// Get mengembalikan copy Worker — caller tidak bisa mutasi data store.
+func (s *Store) Get(id string) (Worker, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	w, ok := s.data[id]
-	return w, ok
+	if !ok {
+		return Worker{}, false
+	}
+	return *w, true
 }
 
 func (s *Store) List() []*Worker {
@@ -271,9 +396,15 @@ func (s *Store) List() []*Worker {
 	defer s.mu.RUnlock()
 	list := make([]*Worker, 0, len(s.data))
 	for _, w := range s.data {
-		list = append(list, w)
+		cp := *w
+		list = append(list, &cp)
 	}
 	return list
+}
+
+// Count mengembalikan jumlah worker tersimpan secara O(1).
+func (s *Store) Count() int64 {
+	return atomic.LoadInt64(&s.count)
 }
 
 // ─────────────────────────────────────────────
@@ -284,8 +415,12 @@ type pipelineCtx struct {
 	Steps map[string]map[string]interface{}
 }
 
-func newPipelineCtx() pipelineCtx {
-	return pipelineCtx{Steps: make(map[string]map[string]interface{})}
+func newPipelineCtx(stepCount int) pipelineCtx {
+	cap := stepCount
+	if cap < 8 {
+		cap = 8
+	}
+	return pipelineCtx{Steps: make(map[string]map[string]interface{}, cap)}
 }
 
 func (p *pipelineCtx) store(stepID string, data map[string]interface{}) {
@@ -347,7 +482,7 @@ func (wr *webhookRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	body, _ := io.ReadAll(io.LimitReader(r.Body, maxWebhookBytes))
 
 	if len(body) > 256 {
 		log.Printf("[worker:%s] WEBHOOK %s %s | body: %s... (%d bytes)",
@@ -360,12 +495,56 @@ func (wr *webhookRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	bodyMap := make(map[string]interface{})
 	_ = json.Unmarshal(body, &bodyMap)
 
+	// Expose _query params
+	if r.URL.RawQuery != "" {
+		qmap := make(map[string]interface{})
+		for k, v := range r.URL.Query() {
+			if len(v) == 1 {
+				qmap[k] = v[0]
+			} else {
+				sl := make([]interface{}, len(v))
+				for i, vv := range v {
+					sl[i] = vv
+				}
+				qmap[k] = sl
+			}
+		}
+		bodyMap["_query"] = qmap
+	}
+
+	// Expose _headers (filter sensitif)
+	blocked := map[string]bool{
+		"Authorization": true, "Cookie": true, "Set-Cookie": true,
+	}
+	hmap := make(map[string]interface{})
+	for k, v := range r.Header {
+		if blocked[k] {
+			continue
+		}
+		if len(v) == 1 {
+			hmap[k] = v[0]
+		} else {
+			sl := make([]interface{}, len(v))
+			for i, vv := range v {
+				sl[i] = vv
+			}
+			hmap[k] = sl
+		}
+	}
+	bodyMap["_headers"] = hmap
+
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintln(w, `{"status":"received"}`)
+
+	// HTTP 429 jika worker sedang memproses (channel penuh)
 	select {
 	case entry.arrived <- bodyMap:
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, `{"status":"received"}`)
 	default:
+		w.WriteHeader(http.StatusTooManyRequests)
+		fmt.Fprintln(w, `{"error":"worker busy, retry later"}`)
+		log.Printf("[worker:%s] WEBHOOK %s %s DROPPED — worker busy (HTTP 429)",
+			entry.workerID, r.Method, r.URL.Path)
 	}
 }
 
@@ -373,68 +552,144 @@ func (wr *webhookRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //  Runtime
 // ─────────────────────────────────────────────
 
-var loopDelay = 50 * time.Millisecond
-
 type Runtime struct {
-	mu      sync.Mutex
-	cancels map[string]context.CancelFunc
+	mu       sync.Mutex
+	cancels  map[string]context.CancelFunc
+	statuses map[string]*WorkerStatus
 }
 
 func newRuntime() *Runtime {
-	return &Runtime{cancels: make(map[string]context.CancelFunc)}
+	return &Runtime{
+		cancels:  make(map[string]context.CancelFunc),
+		statuses: make(map[string]*WorkerStatus),
+	}
 }
 
-func (rt *Runtime) Start(w *Worker, store *Store, hooks *webhookRouter) {
+func (rt *Runtime) ActiveCount() int {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return len(rt.cancels)
+}
+
+func (rt *Runtime) getStatus(id string) WorkerStatus {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if s, ok := rt.statuses[id]; ok {
+		return *s
+	}
+	return WorkerStatus{ID: id}
+}
+
+func (rt *Runtime) updateStatus(id string, ok bool, errMsg string) {
+	rt.mu.Lock()
+	s, exists := rt.statuses[id]
+	if !exists {
+		s = &WorkerStatus{ID: id}
+		rt.statuses[id] = s
+	}
+	s.LastRunAt = time.Now()
+	s.LastRunOk = ok
+	s.LastError = errMsg
+	s.RunCount++
+	rt.mu.Unlock()
+}
+
+func (rt *Runtime) Start(w Worker, store *Store, hooks *webhookRouter) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	if _, running := rt.cancels[w.ID]; running {
 		return
 	}
-	mode := w.Mode
-	if mode == "" {
-		mode = ModeOnce
+
+	// Init status
+	if _, ok := rt.statuses[w.ID]; !ok {
+		rt.statuses[w.ID] = &WorkerStatus{ID: w.ID}
 	}
+	rt.statuses[w.ID].Running = true
+
 	ctx, cancel := context.WithCancel(context.Background())
 	rt.cancels[w.ID] = cancel
 
 	preparedSteps, stepIndex := prepareSteps(w.Steps)
+	mode := w.Mode
+	if mode == "" {
+		mode = ModeOnce
+	}
 
 	go func() {
-		pctx := newPipelineCtx()
-		timer := time.NewTimer(loopDelay)
+		workerID := w.ID
+
+		// FASE 0-A: recover dari panic — isolasi worker
+		defer func() {
+			if r := recover(); r != nil {
+				stack := debug.Stack()
+				errMsg := fmt.Sprintf("PANIC: %v", r)
+				log.Printf("[worker:%s] %s\n%s", workerID, errMsg, stack)
+				rt.updateStatus(workerID, false, errMsg)
+				rt.mu.Lock()
+				rt.statuses[workerID].Running = false
+				delete(rt.cancels, workerID)
+				rt.mu.Unlock()
+				// Update store: running=false
+				if wk, ok := store.Get(workerID); ok {
+					wk.Running = false
+					wk.Updated = time.Now()
+					store.Save(&wk)
+				}
+			}
+		}()
+
+		pctx := newPipelineCtx(len(preparedSteps))
+		timer := time.NewTimer(w.loopDelay())
 		timer.Stop()
 
 		for {
-			runWorker(ctx, w, preparedSteps, stepIndex, hooks, &pctx)
+			// Refresh vars dari store tiap iterasi (live update vars tanpa restart)
+			latestW, ok := store.Get(workerID)
+			if !ok {
+				break
+			}
+
+			runErr := runWorker(ctx, latestW, preparedSteps, stepIndex, hooks, &pctx)
 			pctx.reset()
+
+			if runErr == "" {
+				rt.updateStatus(workerID, true, "")
+			} else {
+				rt.updateStatus(workerID, false, runErr)
+			}
 
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				if wk, ok := store.Get(w.ID); ok {
+				if wk, ok2 := store.Get(workerID); ok2 {
 					wk.Running = false
 					wk.Updated = time.Now()
-					store.Save(wk)
+					store.Save(&wk)
 				}
 				rt.mu.Lock()
-				delete(rt.cancels, w.ID)
+				rt.statuses[workerID].Running = false
+				delete(rt.cancels, workerID)
 				rt.mu.Unlock()
+				log.Printf("[worker:%s] stopped", workerID)
 				return
 			default:
 			}
 
 			if mode == ModeLoop {
-				timer.Reset(loopDelay)
+				delay := latestW.loopDelay()
+				timer.Reset(delay)
 				select {
 				case <-ctx.Done():
 					timer.Stop()
-					if wk, ok := store.Get(w.ID); ok {
+					if wk, ok2 := store.Get(workerID); ok2 {
 						wk.Running = false
 						wk.Updated = time.Now()
-						store.Save(wk)
+						store.Save(&wk)
 					}
 					rt.mu.Lock()
-					delete(rt.cancels, w.ID)
+					rt.statuses[workerID].Running = false
+					delete(rt.cancels, workerID)
 					rt.mu.Unlock()
 					return
 				case <-timer.C:
@@ -442,13 +697,15 @@ func (rt *Runtime) Start(w *Worker, store *Store, hooks *webhookRouter) {
 				continue
 			}
 
-			if wk, ok := store.Get(w.ID); ok {
+			// once — selesai
+			if wk, ok2 := store.Get(workerID); ok2 {
 				wk.Running = false
 				wk.Updated = time.Now()
-				store.Save(wk)
+				store.Save(&wk)
 			}
 			rt.mu.Lock()
-			delete(rt.cancels, w.ID)
+			rt.statuses[workerID].Running = false
+			delete(rt.cancels, workerID)
 			rt.mu.Unlock()
 			return
 		}
@@ -464,6 +721,21 @@ func (rt *Runtime) Stop(id string) {
 	}
 }
 
+// StopAll menghentikan semua worker (untuk graceful shutdown).
+func (rt *Runtime) StopAll() {
+	rt.mu.Lock()
+	ids := make([]string, 0, len(rt.cancels))
+	for id, cancel := range rt.cancels {
+		cancel()
+		ids = append(ids, id)
+	}
+	for _, id := range ids {
+		delete(rt.cancels, id)
+	}
+	rt.mu.Unlock()
+	log.Printf("runtime: stopped %d worker(s)", len(ids))
+}
+
 func (rt *Runtime) IsRunning(id string) bool {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -472,25 +744,18 @@ func (rt *Runtime) IsRunning(id string) bool {
 }
 
 // ─────────────────────────────────────────────
-//  runWorker — index-based traversal dengan goto support
-//
-//  Traversal pakai pointer index `i` (bukan range) agar bisa di-jump
-//  oleh branch atau step.Next ke step ID manapun secara O(1).
-//
-//  Proteksi infinite loop: max jumpLimit jump per satu run.
-//  Jika terlampaui → log error + abort run (tidak crash server).
+//  runWorker — index-based traversal + goto
+//  Return: error string (kosong = sukses)
 // ─────────────────────────────────────────────
-
-const jumpLimit = 1000
 
 func runWorker(
 	ctx context.Context,
-	w *Worker,
+	w Worker,
 	steps []Step,
 	stepIndex map[string]int,
 	hooks *webhookRouter,
 	pctx *pipelineCtx,
-) {
+) string {
 	vars := w.Vars
 	if vars == nil {
 		vars = map[string]map[string]string{}
@@ -498,12 +763,13 @@ func runWorker(
 
 	jumps := 0
 	i := 0
+	lastErr := ""
 
 	for i < len(steps) {
 		select {
 		case <-ctx.Done():
-			log.Printf("[worker:%s] stopped", w.ID)
-			return
+			log.Printf("[worker:%s] stopped mid-run", w.ID)
+			return "stopped"
 		default:
 		}
 
@@ -514,7 +780,7 @@ func runWorker(
 			continue
 		}
 
-		nextIdx := i + 1 // default: sequential
+		nextIdx := i + 1
 		jumped := false
 
 		switch step.Type {
@@ -540,6 +806,9 @@ func runWorker(
 			if step.parsedOutput != nil {
 				pctx.store(step.ID, renderOutputParsed(step.parsedOutput, *pctx, vars))
 			}
+			if errVal, ok := out["_error"]; ok {
+				lastErr = fmt.Sprintf("call_api step %s: %v", step.stepLabel(), errVal)
+			}
 
 		case "branch":
 			gotoID := execBranch(w.ID, step, *pctx, vars)
@@ -547,9 +816,10 @@ func runWorker(
 				if target, ok := stepIndex[gotoID]; ok {
 					jumps++
 					if jumps > jumpLimit {
-						log.Printf("[worker:%s][step:%s] BRANCH jump limit (%d) exceeded — aborting run",
+						msg := fmt.Sprintf("[worker:%s][step:%s] BRANCH jump limit (%d) exceeded — aborting run",
 							w.ID, step.stepLabel(), jumpLimit)
-						return
+						log.Print(msg)
+						return msg
 					}
 					nextIdx = target
 					jumped = true
@@ -564,6 +834,13 @@ func runWorker(
 					w.ID, step.stepLabel())
 			}
 
+		case "sleep":
+			execSleep(ctx, w.ID, step, *pctx, vars)
+			pctx.store(step.ID, map[string]interface{}{"done": true})
+
+		case "set_var":
+			execSetVar(w.ID, step, pctx, vars)
+
 		default:
 			log.Printf("[worker:%s][step:%s] unknown type: %q", w.ID, step.stepLabel(), step.Type)
 		}
@@ -573,9 +850,10 @@ func runWorker(
 			if target, ok := stepIndex[step.Next]; ok {
 				jumps++
 				if jumps > jumpLimit {
-					log.Printf("[worker:%s][step:%s] NEXT jump limit (%d) exceeded — aborting run",
+					msg := fmt.Sprintf("[worker:%s][step:%s] NEXT jump limit (%d) exceeded — aborting run",
 						w.ID, step.stepLabel(), jumpLimit)
-					return
+					log.Print(msg)
+					return msg
 				}
 				nextIdx = target
 				log.Printf("[worker:%s][step:%s] NEXT → goto %q (idx %d)",
@@ -587,13 +865,11 @@ func runWorker(
 	}
 
 	log.Printf("[worker:%s] workflow completed", w.ID)
+	return lastErr
 }
 
 // ─────────────────────────────────────────────
 //  Branch executor
-//
-//  Evaluasi cases berurutan — cocok pertama menang.
-//  Return: step ID tujuan dari case yang cocok, atau "" jika tidak ada.
 // ─────────────────────────────────────────────
 
 func execBranch(workerID string, step Step, pctx pipelineCtx, vars map[string]map[string]string) string {
@@ -602,7 +878,6 @@ func execBranch(workerID string, step Step, pctx pipelineCtx, vars map[string]ma
 	}
 	for i, c := range step.Value.Cases {
 		if c.When == nil {
-			// else — selalu cocok
 			log.Printf("[worker:%s][step:%s] BRANCH case[%d] else → goto %q",
 				workerID, step.stepLabel(), i, c.Goto)
 			return c.Goto
@@ -620,9 +895,6 @@ func execBranch(workerID string, step Step, pctx pipelineCtx, vars map[string]ma
 	return ""
 }
 
-// evalCondition mengevaluasi satu Condition setelah render template.
-// Jika kedua sisi bisa di-parse float64 → numeric comparison.
-// Fallback ke string comparison.
 func evalCondition(c *Condition, pctx pipelineCtx, vars map[string]map[string]string) bool {
 	left := renderTemplate(c.Left, pctx, vars)
 	right := renderTemplate(c.Right, pctx, vars)
@@ -704,9 +976,95 @@ func execWebhook(ctx context.Context, workerID string, step Step, hooks *webhook
 	}
 }
 
-var apiClient = &http.Client{Timeout: 30 * time.Second}
+// HTTP client dengan connection pool yang dioptimalkan untuk 1 CPU / 1GB RAM
+var apiClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        50,
+		MaxIdleConnsPerHost: 5,
+		IdleConnTimeout:     30 * time.Second,
+		DisableKeepAlives:   false,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	},
+}
+
+// acquireCallSlot mengambil slot semaphore call_api, aware ctx.
+func acquireCallSlot(ctx context.Context) bool {
+	select {
+	case callAPISem <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func releaseCallSlot() {
+	<-callAPISem
+}
 
 func execCallAPI(ctx context.Context, workerID string, step Step, pctx pipelineCtx, vars map[string]map[string]string) map[string]interface{} {
+	cfg := step.Value
+
+	// Retry config
+	maxTry := 1
+	delayMs := 500
+	backoff := false
+	if cfg.Retry != nil {
+		maxTry = cfg.Retry.Max + 1
+		if maxTry > maxRetryCount+1 {
+			maxTry = maxRetryCount + 1
+		}
+		if maxTry < 1 {
+			maxTry = 1
+		}
+		delayMs = cfg.Retry.DelayMs
+		if delayMs < 0 {
+			delayMs = 0
+		}
+		backoff = cfg.Retry.Backoff
+	}
+
+	var lastOut map[string]interface{}
+
+	for attempt := 0; attempt < maxTry; attempt++ {
+		if attempt > 0 {
+			delay := time.Duration(delayMs) * time.Millisecond
+			if backoff {
+				delay = delay * time.Duration(1<<uint(attempt-1))
+			}
+			select {
+			case <-ctx.Done():
+				return map[string]interface{}{"_error": "cancelled", "_attempts": attempt}
+			case <-time.After(delay):
+			}
+			log.Printf("[worker:%s][step:%s] CALL_API retry %d/%d", workerID, step.stepLabel(), attempt, maxTry-1)
+		}
+
+		// Acquire semaphore
+		if !acquireCallSlot(ctx) {
+			return map[string]interface{}{"_error": "cancelled (semaphore)", "_attempts": attempt + 1}
+		}
+
+		out, retry := doCallAPI(ctx, workerID, step, pctx, vars, attempt)
+		releaseCallSlot()
+
+		lastOut = out
+		if !retry {
+			return out
+		}
+	}
+
+	if lastOut == nil {
+		lastOut = map[string]interface{}{}
+	}
+	lastOut["_attempts"] = maxTry
+	return lastOut
+}
+
+func doCallAPI(ctx context.Context, workerID string, step Step, pctx pipelineCtx, vars map[string]map[string]string, attempt int) (map[string]interface{}, bool) {
 	cfg := step.Value
 	renderedURL := renderTemplate(cfg.URL, pctx, vars)
 
@@ -718,7 +1076,7 @@ func execCallAPI(ctx context.Context, workerID string, step Step, pctx pipelineC
 	req, err := http.NewRequestWithContext(ctx, string(cfg.Method), renderedURL, reqBody)
 	if err != nil {
 		log.Printf("[worker:%s][step:%s] CALL_API build error: %v", workerID, step.stepLabel(), err)
-		return map[string]interface{}{}
+		return map[string]interface{}{"_error": err.Error(), "_attempts": attempt + 1}, false
 	}
 	if len(cfg.Body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
@@ -730,7 +1088,8 @@ func execCallAPI(ctx context.Context, workerID string, step Step, pctx pipelineC
 	resp, err := apiClient.Do(req)
 	if err != nil {
 		log.Printf("[worker:%s][step:%s] CALL_API error: %v", workerID, step.stepLabel(), err)
-		return map[string]interface{}{}
+		// Network error → bisa retry
+		return map[string]interface{}{"_error": err.Error(), "_attempts": attempt + 1}, cfg.Retry != nil
 	}
 	defer resp.Body.Close()
 
@@ -744,12 +1103,59 @@ func execCallAPI(ctx context.Context, workerID string, step Step, pctx pipelineC
 			workerID, step.stepLabel(), cfg.Method, renderedURL, resp.StatusCode, respRaw)
 	}
 
+	// Retry untuk 429 dan 5xx
+	shouldRetry := cfg.Retry != nil && (resp.StatusCode == 429 || resp.StatusCode >= 500)
+
 	out := make(map[string]interface{})
 	if err := json.Unmarshal(respRaw, &out); err != nil {
 		out["raw"] = string(respRaw)
 		out["status"] = resp.StatusCode
 	}
-	return out
+	out["_status"] = resp.StatusCode
+
+	if shouldRetry {
+		out["_error"] = fmt.Sprintf("HTTP %d", resp.StatusCode)
+	}
+	return out, shouldRetry
+}
+
+// execSleep — sleep cancellable, max 60 detik.
+func execSleep(ctx context.Context, workerID string, step Step, pctx pipelineCtx, vars map[string]map[string]string) {
+	cfg := step.Value
+	ms := cfg.SleepMs
+	if cfg.SleepSeconds > 0 {
+		ms = cfg.SleepSeconds * 1000
+	}
+	// render template jika mengandung {{}}
+	if ms == 0 && strings.Contains(cfg.Message, "{{") {
+		// fallback ke 0
+	}
+	if ms > maxSleepMs {
+		ms = maxSleepMs
+	}
+	if ms <= 0 {
+		return
+	}
+	log.Printf("[worker:%s][step:%s] SLEEP %dms", workerID, step.stepLabel(), ms)
+	select {
+	case <-time.After(time.Duration(ms) * time.Millisecond):
+	case <-ctx.Done():
+		log.Printf("[worker:%s][step:%s] SLEEP cancelled", workerID, step.stepLabel())
+	}
+}
+
+// execSetVar — simpan nilai ke pctx.
+func execSetVar(workerID string, step Step, pctx *pipelineCtx, vars map[string]map[string]string) {
+	cfg := step.Value
+	if cfg.SetKey == "" {
+		log.Printf("[worker:%s][step:%s] SET_VAR: set_key kosong", workerID, step.stepLabel())
+		return
+	}
+	rendered := renderTemplate(cfg.SetValue, *pctx, vars)
+	pctx.store(step.ID, map[string]interface{}{
+		cfg.SetKey: rendered,
+	})
+	log.Printf("[worker:%s][step:%s] SET_VAR %q = %q", workerID, step.stepLabel(), cfg.SetKey, rendered)
 }
 
 // ─────────────────────────────────────────────
@@ -806,6 +1212,12 @@ func applyTemplates(s string, pctx pipelineCtx, vars map[string]map[string]strin
 }
 
 func resolveToken(inner string, pctx pipelineCtx, vars map[string]map[string]string) (string, bool) {
+	// Prefix json: → JSON-safe escape
+	jsonMode := strings.HasPrefix(inner, "json:")
+	if jsonMode {
+		inner = inner[5:]
+	}
+
 	dotIdx := strings.Index(inner, ".")
 	if dotIdx <= 0 {
 		return "", false
@@ -813,13 +1225,30 @@ func resolveToken(inner string, pctx pipelineCtx, vars map[string]map[string]str
 	ns := inner[:dotIdx]
 	key := inner[dotIdx+1:]
 
+	var resolved string
+	found := false
+
 	if bucket, ok := vars[ns]; ok {
-		return bucket[key], true
+		resolved = bucket[key]
+		found = true
+	} else if stepData, ok := pctx.Steps[ns]; ok {
+		resolved = valueToString(resolveKey(key, stepData))
+		found = true
 	}
-	if stepData, ok := pctx.Steps[ns]; ok {
-		return valueToString(resolveKey(key, stepData)), true
+
+	if !found {
+		return "", false
 	}
-	return "", false
+
+	if jsonMode {
+		// JSON-safe: escape untuk diinjeksikan dalam string JSON
+		b, _ := json.Marshal(resolved)
+		// json.Marshal menghasilkan "\"...\""  — strip outer quotes
+		if len(b) >= 2 {
+			return string(b[1 : len(b)-1]), true
+		}
+	}
+	return resolved, true
 }
 
 func valueToString(v interface{}) string {
@@ -893,6 +1322,45 @@ func renderValue(v interface{}, pctx pipelineCtx, vars map[string]map[string]str
 }
 
 // ─────────────────────────────────────────────
+//  Helpers
+// ─────────────────────────────────────────────
+
+// stepsHash menghasilkan hash FNV-64 dari steps JSON — lebih cepat dari DeepEqual.
+func stepsHash(steps []Step) uint64 {
+	b, _ := json.Marshal(steps)
+	h := fnv.New64a()
+	h.Write(b)
+	return h.Sum64()
+}
+
+// validateStepIDs memastikan tidak ada duplikasi ID.
+func validateStepIDs(steps []Step) error {
+	seen := make(map[string]bool, len(steps))
+	for _, s := range steps {
+		if s.ID != "" {
+			if seen[s.ID] {
+				return fmt.Errorf("duplicate step ID: %s", s.ID)
+			}
+			seen[s.ID] = true
+		}
+	}
+	return nil
+}
+
+// validateVars memastikan vars tidak melebihi batas.
+func validateVars(vars map[string]map[string]string) error {
+	if len(vars) > maxVarsBuckets {
+		return fmt.Errorf("max %d vars buckets allowed", maxVarsBuckets)
+	}
+	for bucket, m := range vars {
+		if len(m) > maxVarsPerBucket {
+			return fmt.Errorf("bucket %q exceeds max %d keys", bucket, maxVarsPerBucket)
+		}
+	}
+	return nil
+}
+
+// ─────────────────────────────────────────────
 //  HTTP handlers
 // ─────────────────────────────────────────────
 
@@ -905,7 +1373,7 @@ type App struct {
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func errJSON(w http.ResponseWriter, code int, msg string) {
@@ -939,17 +1407,52 @@ func assignStepIDs(steps []Step) {
 	}
 }
 
+// requireJSON memvalidasi Content-Type untuk POST/PUT.
+func requireJSON(w http.ResponseWriter, r *http.Request) bool {
+	ct := r.Header.Get("Content-Type")
+	if !strings.HasPrefix(ct, "application/json") {
+		errJSON(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+		return false
+	}
+	return true
+}
+
 // POST /create
 func (a *App) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errJSON(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
+	if !requireJSON(w, r) {
+		return
+	}
+
+	// Cek batas total stored
+	if a.store.Count() >= maxStoredWorkers {
+		errJSON(w, http.StatusServiceUnavailable, fmt.Sprintf("max %d stored workers reached", maxStoredWorkers))
+		return
+	}
+
 	var worker Worker
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&worker); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxBodyBytes)).Decode(&worker); err != nil {
 		errJSON(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
+
+	// Validasi steps
+	if len(worker.Steps) > maxStepsPerWorker {
+		errJSON(w, http.StatusBadRequest, fmt.Sprintf("max %d steps per worker", maxStepsPerWorker))
+		return
+	}
+	if err := validateStepIDs(worker.Steps); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validateVars(worker.Vars); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	if worker.ID == "" {
 		worker.ID = uniqueID()
 	}
@@ -960,8 +1463,17 @@ func (a *App) handleCreate(w http.ResponseWriter, r *http.Request) {
 		worker.Mode = ModeOnce
 	}
 	a.store.Save(&worker)
+
 	if worker.Running {
-		a.runtime.Start(&worker, a.store, a.hooks)
+		// Cek batas concurrent
+		if a.runtime.ActiveCount() >= maxConcurrentWorkers {
+			worker.Running = false
+			a.store.Save(&worker)
+			writeJSON(w, http.StatusCreated, worker)
+			log.Printf("[worker:%s] created but not started — max concurrent workers (%d) reached", worker.ID, maxConcurrentWorkers)
+			return
+		}
+		a.runtime.Start(worker, a.store, a.hooks)
 	}
 	writeJSON(w, http.StatusCreated, worker)
 }
@@ -982,14 +1494,29 @@ func (a *App) handleGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, worker)
 }
 
+// GET /status?id=<id>
+func (a *App) handleStatus(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if _, ok := a.store.Get(id); !ok {
+		errJSON(w, http.StatusNotFound, "worker not found")
+		return
+	}
+	st := a.runtime.getStatus(id)
+	st.Running = a.runtime.IsRunning(id)
+	writeJSON(w, http.StatusOK, st)
+}
+
 // PUT /update
 func (a *App) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		errJSON(w, http.StatusMethodNotAllowed, "PUT only")
 		return
 	}
+	if !requireJSON(w, r) {
+		return
+	}
 	var updated Worker
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&updated); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxBodyBytes)).Decode(&updated); err != nil {
 		errJSON(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
@@ -998,18 +1525,41 @@ func (a *App) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotFound, "worker not found")
 		return
 	}
+
+	// Validasi
+	if len(updated.Steps) > maxStepsPerWorker {
+		errJSON(w, http.StatusBadRequest, fmt.Sprintf("max %d steps per worker", maxStepsPerWorker))
+		return
+	}
+	if err := validateStepIDs(updated.Steps); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validateVars(updated.Vars); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	updated.Created = existing.Created
 	updated.Updated = time.Now()
 
+	// Ganti DeepEqual dengan FNV hash — lebih cepat dan akurat untuk RawMessage
 	wasRunning := a.runtime.IsRunning(updated.ID)
-	if wasRunning && !reflect.DeepEqual(existing.Steps, updated.Steps) {
+	if wasRunning && stepsHash(existing.Steps) != stepsHash(updated.Steps) {
 		a.runtime.Stop(updated.ID)
 		wasRunning = false
 	}
 	assignStepIDs(updated.Steps)
 	a.store.Save(&updated)
+
 	if updated.Running && !wasRunning {
-		a.runtime.Start(&updated, a.store, a.hooks)
+		if a.runtime.ActiveCount() >= maxConcurrentWorkers {
+			updated.Running = false
+			a.store.Save(&updated)
+			writeJSON(w, http.StatusOK, updated)
+			return
+		}
+		a.runtime.Start(updated, a.store, a.hooks)
 	}
 	writeJSON(w, http.StatusOK, updated)
 }
@@ -1046,9 +1596,14 @@ func (a *App) handleRun(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "already running", "mode": worker.Mode})
 		return
 	}
+	// Cek limit concurrent
+	if a.runtime.ActiveCount() >= maxConcurrentWorkers {
+		errJSON(w, http.StatusServiceUnavailable, fmt.Sprintf("max %d concurrent workers reached", maxConcurrentWorkers))
+		return
+	}
 	worker.Running = true
 	worker.Updated = time.Now()
-	a.store.Save(worker)
+	a.store.Save(&worker)
 	a.runtime.Start(worker, a.store, a.hooks)
 	writeJSON(w, http.StatusOK, map[string]interface{}{"status": "started", "mode": worker.Mode})
 }
@@ -1068,7 +1623,7 @@ func (a *App) handleStop(w http.ResponseWriter, r *http.Request) {
 	a.runtime.Stop(id)
 	worker.Running = false
 	worker.Updated = time.Now()
-	a.store.Save(worker)
+	a.store.Save(&worker)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
 }
 
@@ -1077,7 +1632,8 @@ func (a *App) handleStop(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────────────────────────
 
 func main() {
-	runtime.GOMAXPROCS(1)
+	// FASE 2-A: Hapus GOMAXPROCS(1) — Go scheduler mengatur sendiri
+	// runtime.GOMAXPROCS(1) ← dihapus
 
 	store, err := openStore()
 	if err != nil {
@@ -1085,28 +1641,38 @@ func main() {
 	}
 
 	hooks := newWebhookRouter()
-	app := &App{store: store, runtime: newRuntime(), hooks: hooks}
+	rt := newRuntime()
+	app := &App{store: store, runtime: rt, hooks: hooks}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/create", app.handleCreate)
 	mux.HandleFunc("/list", app.handleList)
 	mux.HandleFunc("/get", app.handleGet)
+	mux.HandleFunc("/status", app.handleStatus)
 	mux.HandleFunc("/update", app.handleUpdate)
 	mux.HandleFunc("/delete", app.handleDelete)
 	mux.HandleFunc("/run", app.handleRun)
 	mux.HandleFunc("/stop", app.handleStop)
 	mux.Handle("/", hooks)
 
+	// FASE 3-F: Staggered start — jeda random antar worker saat boot
+	runningWorkers := make([]Worker, 0)
 	for _, w := range store.List() {
 		if w.Running {
-			log.Printf("auto-starting worker %s (%s)", w.ID, w.Name)
-			app.runtime.Start(w, store, hooks)
+			runningWorkers = append(runningWorkers, *w)
 		}
+	}
+	log.Printf("auto-starting %d worker(s) with staggered delay", len(runningWorkers))
+	for i, w := range runningWorkers {
+		wCopy := w
+		delay := time.Duration(staggerMinMs+mrand.Intn(staggerMaxMs)) * time.Millisecond * time.Duration(i+1)
+		time.AfterFunc(delay, func() {
+			log.Printf("auto-starting worker %s (%s)", wCopy.ID, wCopy.Name)
+			app.runtime.Start(wCopy, store, hooks)
+		})
 	}
 
 	addr := ":8080"
-	log.Printf("worker-engine listening on %s", addr)
-
 	srv := &http.Server{
 		Addr:         addr,
 		Handler:      mux,
@@ -1114,7 +1680,35 @@ func main() {
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
-	if err := srv.ListenAndServe(); err != nil {
-		log.Fatal(err)
+
+	// FASE 0-B: Graceful shutdown
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		log.Printf("worker-engine listening on %s", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	<-sigCtx.Done()
+	log.Println("shutdown signal received — stopping workers...")
+
+	// Stop semua worker
+	rt.StopAll()
+
+	// Beri waktu 5 detik untuk server selesai
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("server shutdown error: %v", err)
 	}
+
+	// Flush terakhir store
+	store.shutdown()
+	// Tunggu sebentar agar flusher selesai
+	time.Sleep(500 * time.Millisecond)
+
+	log.Println("worker-engine exited cleanly")
 }

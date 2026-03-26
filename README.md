@@ -15,11 +15,11 @@
 <br/>
 
 Define workflows in JSON. Run them as isolated workers.  
-**Webhook → Call API → Log** — with a full data pipeline, vars system, and zero `go get`.
+**Webhook → Branch → Call API → Log** — with full pipeline, vars, retry, sleep, and zero `go get`.
 
 <br/>
 
-[**Quick Start**](#-quick-start) · [**Pipeline**](#-pipeline--data-flow) · [**Vars**](#-vars-system) · [**API**](#-api-reference) · [**Docs**](doc.md) · [**curl Guide**](curl.md)
+[**Quick Start**](#-quick-start) · [**Pipeline**](#-pipeline--data-flow) · [**Step Types**](#-step-types) · [**Vars**](#-vars-system) · [**API**](#-api-reference) · [**Docs**](doc.md) · [**curl Guide**](curl.md)
 
 </div>
 
@@ -29,15 +29,20 @@ Define workflows in JSON. Run them as isolated workers.
 
 | | Feature | Description |
 |-|---------|-------------|
-| 🪝 | **Webhook** | Accept `GET`/`POST` — request body flows into pipeline automatically |
-| 🌐 | **Call API** | Hit external URLs — response body flows into pipeline for next steps |
+| 🪝 | **Webhook** | Accept `GET`/`POST` — body, query params, and headers flow into pipeline |
+| 🌐 | **Call API** | Hit external URLs — response flows into pipeline; built-in retry & backoff |
 | 🖨️ | **Log** | Print messages to stdout with `{{stepId.field}}` templates |
-| 🔀 | **Data Pipeline** | Every step's output stored by ID, accessible in all subsequent steps |
+| 🔀 | **Branch** | Conditional routing — `==` `!=` `>` `<` `contains` `starts_with` `ends_with` |
+| ⏱️ | **Sleep** | Explicit delay up to 60s — cancellable, for rate limiting and backoff |
+| 📝 | **Set Var** | Store computed values inline — no API call needed for data transforms |
+| 🔄 | **Data Pipeline** | Every step output stored by ID, accessible via `{{stepId.field}}` |
 | 📦 | **Vars System** | Multi-bucket static config — cross-reference between buckets freely |
-| 🔁 | **Worker Modes** | `once` — run once; `loop` — restart automatically forever |
-| 💾 | **Persistent** | Workers survive restarts via `gob` storage |
-| ♻️ | **Auto-resume** | Running workers restart automatically on server startup |
-| 🔒 | **No Collisions** | Webhook paths namespaced by worker UUID |
+| 🔁 | **Worker Modes** | `once` — run once; `loop` — restart automatically with configurable interval |
+| 💾 | **Persistent** | Workers survive restarts via `gob` storage with atomic crash-safe write |
+| ♻️ | **Auto-resume** | Running workers restart automatically on boot with staggered delay |
+| 🛡️ | **Isolated** | Each worker in its own goroutine — panic in one never affects others |
+| 📊 | **Status API** | `GET /status` — runtime info, run count, last error, without reading logs |
+| 🚦 | **Multi-tenant** | Hard limits: 50 concurrent · 500 stored · 100 steps · 20 API calls |
 
 ---
 
@@ -48,7 +53,9 @@ go run main.go
 ```
 
 ```bash
-curl -X POST http://localhost:8080/create -H "Content-Type: application/json" -d '{
+curl -X POST http://localhost:8080/create \
+  -H "Content-Type: application/json" \
+  -d '{
   "name": "AI Worker",
   "mode": "loop",
   "running": true,
@@ -65,7 +72,8 @@ curl -X POST http://localhost:8080/create -H "Content-Type: application/json" -d
         "method": "POST",
         "url": "{{glb.url}}",
         "headers": { "Authorization": "Bearer {{pvt.token}}" },
-        "body": { "messages": [{ "role": "user", "content": "{{hook.question}}" }] }
+        "body": { "messages": [{ "role": "user", "content": "{{hook.question}}" }] },
+        "retry": { "max": 3, "delay_ms": 500, "backoff": true }
     }},
     { "type": "log", "value": { "message": "Answer: {{ai.result.response}}" } }
   ]
@@ -73,7 +81,6 @@ curl -X POST http://localhost:8080/create -H "Content-Type: application/json" -d
 ```
 
 ```bash
-# Trigger — data flows through all steps
 curl -X POST http://localhost:8080/<workerID>/ask \
   -H "Content-Type: application/json" \
   -d '{"question": "What is the best food?"}'
@@ -84,27 +91,26 @@ curl -X POST http://localhost:8080/<workerID>/ask \
 [worker:...] CALL_API POST https://... → HTTP 200 | {"result":{"response":"Pizza!"}...}
 [worker:...] LOG → Answer: Pizza!
 [worker:...] workflow completed
-[worker:...] mode=loop, restarting...
 ```
 
 ---
 
 ## 🔀 Pipeline & Data Flow
 
-Every step that produces output stores it in the pipeline, keyed by its `id`. Subsequent steps can reference any previous step's output.
+Every step that produces output stores it by `id`. All subsequent steps can reference any previous step's output.
 
 ```
 Step: webhook  (id="hook")
-  ← POST body: {"sys":"answer briefly", "usr":"best food?"}
-  → pipeline["hook"] = {"sys":"answer briefly", "usr":"best food?"}
+  ← POST body: {"question": "best food?"}
+  → pipeline["hook"] = {"question":"best food?", "_query":{...}, "_headers":{...}}
 
 Step: call_api  (id="ai")
-  → body rendered: {{hook.sys}} → "answer briefly"
+  → body rendered: {{hook.question}} → "best food?"
   ← response: {"result": {"response": "Pizza!"}, "success": true}
   → pipeline["ai"] = {"result": {"response": "Pizza!"}, "success": true}
 
 Step: log
-  → "{{ai.result.response}}"  renders to  "Pizza!"
+  → "{{ai.result.response}}" renders to "Pizza!"
 ```
 
 ### Template Syntax
@@ -112,22 +118,142 @@ Step: log
 | Syntax | Source | Example |
 |--------|--------|---------|
 | `{{stepId.field}}` | Step output by ID | `{{hook.username}}` |
-| `{{stepId.a.b}}` | Nested dot-notation | `{{ai.result.response}}` |
+| `{{stepId.a.b.c}}` | Nested dot-notation | `{{ai.result.response}}` |
 | `{{bucket.key}}` | `vars["bucket"]["key"]` | `{{glb.api_url}}` |
+| `{{json:stepId.field}}` | JSON-safe escaped value | `{{json:hook.message}}` |
 
-> **There is no `{{.field}}`** — every reference must be explicit. This makes workflows unambiguous and easy to trace.
+> Use `{{json:step.field}}` when injecting a value that may contain quotes, newlines, or backslashes **inside a JSON body string**. This prevents malformed JSON.
 
-### call_api Response
+### Webhook — Auto Fields
 
-```jsonc
-// Response: {"result": {"response": "Pizza!"}, "success": true}
-"{{ai.result.response}}"  →  "Pizza!"
-"{{ai.success}}"          →  "true"
+Every webhook step automatically exposes:
 
-// Non-JSON response fallback:
-"{{ai.raw}}"    →  raw string body
-"{{ai.status}}" →  HTTP status code
+| Field | Content |
+|-------|---------|
+| `{{hookId.field}}` | Parsed JSON body fields |
+| `{{hookId._query.param}}` | URL query parameters |
+| `{{hookId._headers.X-Custom}}` | Request headers (Authorization/Cookie filtered) |
+
+---
+
+## 🧩 Step Types
+
+### `webhook` — Wait for HTTP request
+
+```json
+{
+  "id": "hook",
+  "type": "webhook",
+  "value": { "method": "POST", "path": "/trigger" }
+}
 ```
+
+Blocks until a request arrives. Path is scoped to worker: `/<workerID>/trigger`.  
+Returns HTTP 429 `{"error":"worker busy"}` if the worker is still processing the previous request.
+
+---
+
+### `call_api` — HTTP request to external URL
+
+```json
+{
+  "id": "result",
+  "type": "call_api",
+  "value": {
+    "method": "POST",
+    "url": "{{glb.api_url}}",
+    "headers": { "Authorization": "Bearer {{pvt.token}}" },
+    "body": { "prompt": "{{hook.text}}" },
+    "retry": { "max": 3, "delay_ms": 500, "backoff": true }
+  }
+}
+```
+
+**Retry config** (optional):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `max` | int | Max retry attempts (hard limit: 5) |
+| `delay_ms` | int | Initial delay between retries in ms |
+| `backoff` | bool | Exponential backoff if true |
+
+Retries on: network error, HTTP 429, HTTP 5xx. On exhaustion, output contains `_error` and `_attempts`.
+
+---
+
+### `log` — Print to stdout
+
+```json
+{ "type": "log", "value": { "message": "User: {{hook.user}} | Score: {{score.value}}" } }
+```
+
+---
+
+### `branch` — Conditional routing
+
+```json
+{
+  "id": "check",
+  "type": "branch",
+  "value": {
+    "cases": [
+      { "when": { "left": "{{hook.type}}", "op": "==", "right": "admin" }, "goto": "admin_flow" },
+      { "when": { "left": "{{score.value}}", "op": ">", "right": "90" },   "goto": "high_score" },
+      { "goto": "default_flow" }
+    ]
+  }
+}
+```
+
+Cases are evaluated in order — first match wins. A case without `when` is an `else` (always matches).  
+`goto` is a step `id`. Empty `goto` means continue sequentially.
+
+**Operators:** `==` `!=` `>` `<` `>=` `<=` `contains` `starts_with` `ends_with`
+
+---
+
+### `sleep` — Explicit delay
+
+```json
+{ "type": "sleep", "value": { "sleep_ms": 500 } }
+```
+
+Or in seconds:
+```json
+{ "type": "sleep", "value": { "sleep_seconds": 2 } }
+```
+
+Maximum 60 seconds. Cancellable — stops immediately when worker is stopped.
+
+---
+
+### `set_var` — Store computed value into pipeline
+
+```json
+{
+  "id": "prepared",
+  "type": "set_var",
+  "value": {
+    "set_key": "full_prompt",
+    "set_value": "Context: {{hook.context}} | Question: {{hook.question}}"
+  }
+}
+```
+
+Stores `full_prompt` in `pipeline["prepared"]`. Access later as `{{prepared.full_prompt}}`.  
+Use this to transform, concat, or rename fields between steps — no API call needed.
+
+---
+
+### `next` field — Force jump
+
+Any step can have a `next` field to unconditionally jump to another step after execution:
+
+```json
+{ "id": "agent_a", "type": "call_api", "value": { ... }, "next": "merge_results" }
+```
+
+If `branch` already jumped, `next` is ignored.
 
 ---
 
@@ -145,11 +271,14 @@ Static configuration in named buckets — cross-reference freely between buckets
     "ai_model": "@cf/meta/llama-3.1-8b-instruct-fast",
     "api_url":  "https://api.cloudflare.com/client/v4/accounts/{{pvt.cf_id}}/ai/run/{{glb.ai_model}}"
   },
-  "env": { "timeout": "30", "region": "asia" }
+  "env": { "region": "asia" }
 }
 ```
 
-`{{glb.api_url}}` resolves fully — `{{pvt.cf_id}}` inside it is substituted first. Buckets can reference each other, resolved iteratively. Bucket names are just conventions — there is no built-in privacy distinction.
+Buckets can reference each other — resolved iteratively up to 20 passes.  
+Vars are read fresh from store on each loop iteration, so updating vars via `/update` takes effect on the next run without restarting the worker.
+
+**Limits:** max 20 buckets, max 50 keys per bucket.
 
 ---
 
@@ -159,94 +288,53 @@ Static configuration in named buckets — cross-reference freely between buckets
 ┌──────────────────────────────────────────────────────────┐
 │                    HTTP Server :8080                     │
 │  ServeMux                                                │
-│  ├─ /create /list /get /update /delete /run /stop        │
+│  ├─ /create /list /get /status /update /delete /run /stop│
 │  └─ /  ──────────────► webhookRouter  O(1) map lookup    │
-│                          chan map[string]interface{}      │
+│                          → HTTP 429 if worker busy       │
 ├──────────────────────────────────────────────────────────┤
-│  Runtime  (goroutine per worker)                         │
-│  pipelineCtx: map[stepID → output]  goroutine-local      │
-│  vars: resolved once per run, immutable during steps     │
+│  Runtime  (goroutine per worker, recover() per goroutine)│
+│  Global semaphore: max 20 concurrent call_api            │
+│  pipelineCtx: goroutine-local, reset each loop           │
+│  Vars snapshot: refreshed each iteration (live update)   │
 ├──────────────────────────────────────────────────────────┤
 │  Store                                                   │
-│  in-memory map + gob atomic write (CreateTemp→Rename)    │
+│  in-memory map + snapshot copy + gob atomic write        │
+│  flush lock released before encode — no contention       │
 └──────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## ⚡ How It Works
+## 🏗️ System Limits
 
-<details>
-<summary><strong>Data Pipeline — step outputs and how they flow</strong></summary>
-<br/>
+All limits are constants at the top of `main.go` — change to suit your needs.
 
-Each step that produces data stores it in `pipelineCtx.Steps[stepID]`. Only steps with a non-empty `id` are stored — steps without an `id` still execute, their output is just not accessible later.
+| Limit | Value | Description |
+|-------|-------|-------------|
+| `maxConcurrentWorkers` | 50 | Max workers running at the same time |
+| `maxStoredWorkers` | 500 | Max workers in the store |
+| `maxStepsPerWorker` | 100 | Max steps per worker |
+| `maxConcurrentCalls` | 20 | Max simultaneous `call_api` HTTP requests |
+| `maxVarsBuckets` | 20 | Max buckets in `vars` |
+| `maxVarsPerBucket` | 50 | Max keys per bucket |
+| `maxBodyBytes` | 128 KB | Max request body for `/create`, `/update` |
+| `maxWebhookBytes` | 64 KB | Max webhook body |
+| `maxRetryCount` | 5 | Max retry attempts for `call_api` |
+| `maxSleepMs` | 60 000 | Max sleep duration (60s) |
+| `minLoopIntervalMs` | 200 | Minimum loop interval |
+| `defaultLoopIntervalMs` | 500 | Default loop interval |
 
-- **webhook** → stores parsed request JSON body
-- **call_api** → stores parsed JSON response body (or `{"raw":"...", "status":N}` for non-JSON)
-- **log** → no output, purely a side effect
+---
 
-`pipelineCtx` is goroutine-local and reset each loop iteration — no data leaks between runs.
+## ⚡ Worker Loop Interval
 
-</details>
+Control how fast a `loop` worker restarts:
 
-<details>
-<summary><strong>Vars — iterative cross-bucket resolution</strong></summary>
-<br/>
-
-`vars` is `map[string]map[string]string`. Template resolution iterates up to 10 passes, processing all buckets simultaneously:
-
-```
-Pass 1: {{pvt.cf_id}} in glb.api_url resolved → "abc123"
-Pass 2: {{glb.api_url}} in step url resolved → "https://.../abc123/ai/run/..."
-```
-
-Circular references are safe — the iteration cap prevents infinite loops.
-
-</details>
-
-<details>
-<summary><strong>webhookRouter — dynamic O(1) dispatch</strong></summary>
-<br/>
-
-`http.ServeMux` panics on duplicate path registration — a problem when workers restart or update.
-
-One `"/"` catch-all on ServeMux delegates to `webhookRouter` — a `sync.RWMutex`-protected map that is freely mutable at runtime. Each entry holds a `chan map[string]interface{}` (buffered, size 1). On request arrival, the body is parsed and sent directly through the channel. `defer hooks.unregister(fullPath)` ensures no stale entries.
-
-Path: `/<workerID><path>` — collision-free by design.
-
-</details>
-
-<details>
-<summary><strong>Storage — crash-safe atomic gob write</strong></summary>
-<br/>
-
-Serialization via `encoding/gob` (binary — faster and smaller than JSON). `Body` fields stored as `json.RawMessage` to avoid gob's limitation with `[]interface{}`.
-
-```
-encode → CreateTemp → Write → fsync → Rename (atomic on all platforms)
+```json
+{ "loop_interval_ms": 1000 }
 ```
 
-After startup, all reads come from in-memory `map[string]*Worker` — zero disk I/O at runtime.
-
-</details>
-
-<details>
-<summary><strong>Running flag sync</strong></summary>
-<br/>
-
-`running` in the store is always kept in sync with the actual goroutine state:
-
-| Event | `running` |
-|-------|-----------|
-| `/run` or create with `running: true` | `true` |
-| `once` — completed naturally | `false` (auto) |
-| `/stop` called | `false` (auto) |
-| `loop` — any time | `true` |
-
-`/list` always reflects the real runtime state.
-
-</details>
+Minimum: 200ms. Default: 500ms. Set to `0` to use the default.
 
 ---
 
@@ -257,11 +345,29 @@ After startup, all reads come from in-memory `map[string]*Worker` — zero disk 
 | `POST` | `/create` | Create a new worker |
 | `GET` | `/list` | List all workers |
 | `GET` | `/get?id=<id>` | Get a single worker |
-| `PUT` | `/update` | Full-replace (auto-restart if steps changed) |
+| `GET` | `/status?id=<id>` | Get runtime status (running, last error, run count) |
+| `PUT` | `/update` | Full-replace a worker (auto-restart if steps changed) |
 | `DELETE` | `/delete?id=<id>` | Delete permanently |
 | `POST` | `/run?id=<id>` | Start a stopped worker |
 | `POST` | `/stop?id=<id>` | Stop a running worker |
 | `ANY` | `/<workerID><path>` | Trigger a webhook step |
+
+All `POST`/`PUT` management endpoints require `Content-Type: application/json`.
+
+### `GET /status?id=<id>` Response
+
+```json
+{
+  "id": "a3f2c1d4-...",
+  "running": true,
+  "last_run_at": "2026-03-26T10:00:00Z",
+  "last_run_ok": true,
+  "last_error": "",
+  "run_count": 42
+}
+```
+
+Status is in-memory only — resets on server restart.
 
 ---
 
@@ -277,10 +383,21 @@ POST /create
       ▼
   [ RUNNING ]
       │
-      ├── POST /stop ────────────► running: false
-      ├── mode=once, done ───────► running: false  →  POST /run to restart
-      └── mode=loop, done ───────► auto restart, running stays true
+      ├── POST /stop ─────────────► running: false
+      ├── mode=once, complete ────► running: false  →  POST /run to restart
+      ├── mode=loop, complete ────► auto restart, running stays true
+      └── panic / fatal error ────► running: false (auto), error in /status
 ```
+
+---
+
+## 🛡️ Reliability & Isolation
+
+- **Panic recovery** — each worker goroutine has `recover()`. A panic sets `running: false`, stores the error in `/status`, and frees the slot. Other workers are unaffected.
+- **Graceful shutdown** — `SIGTERM`/`Ctrl+C` stops all workers, flushes the store, then exits cleanly.
+- **Staggered boot** — workers with `running: true` start with a random 10–50ms × index delay to prevent thundering herd on external APIs.
+- **Live vars** — vars are read from the store at each loop iteration, so you can update vars via `/update` without restarting the worker.
+- **Crash-safe storage** — `CreateTemp → fsync → Rename` ensures `workers.gob` is never corrupted on crash.
 
 ---
 
@@ -289,7 +406,7 @@ POST /create
 ```bash
 go run main.go
 go build -o worker-engine main.go
-go build -ldflags="-s -w" -o worker-engine main.go   # optimized
+go build -ldflags="-s -w" -o worker-engine main.go
 
 # Cross-compile
 GOOS=windows GOARCH=amd64 go build -o worker-engine.exe main.go
@@ -314,21 +431,12 @@ GOOS=darwin  GOARCH=arm64 go build -o worker-engine main.go
 
 ## ⚠️ Limitations
 
-- **Webhook waits for 1 request per step.** `mode: "loop"` handles this automatically.
-- **`{{.field}}` does not exist.** All references must be explicit.
+- **Webhook waits for 1 request per step.** `mode: "loop"` handles this automatically. Returns HTTP 429 if the worker is still busy with the previous request.
 - **`call_api` body is JSON only.** `form-urlencoded` / `multipart` not supported.
-- **Vars are static.** Cannot change while worker is running.
-- **Pipeline data is not persistent.** Lost when worker completes or restarts.
+- **Pipeline data is not persistent.** Lost when worker completes or restarts. Only vars and store data persist.
+- **Status data is in-memory.** `run_count`, `last_error`, `last_run_at` reset on server restart.
 - **No authentication** on API endpoints.
 - **Single process** — not designed for distributed deployment.
-
----
-
-## 📄 License
-
-```
-MIT License — free to use, modify, and distribute.
-```
 
 ---
 

@@ -29,27 +29,36 @@ const (
 	MethodPOST HTTPMethod = "POST"
 )
 
-type WebhookStep struct {
-	Method HTTPMethod `json:"method"` // "GET" | "POST"
-	Path   string     `json:"path"`   // e.g. "/hook/order"
-}
+// StepValue holds the config specific to each step type.
+// All three types share the same "value" key in JSON.
+//
+//	log      → { "message": "..." }
+//	webhook  → { "method": "POST", "path": "/hook/order" }
+//	call_api → { "method": "POST", "url": "...", "headers": {}, "body": {} }
+type StepValue struct {
+	// log
+	Message string `json:"message,omitempty"`
 
-type LogStep struct {
-	Message string `json:"message"`
-}
+	// webhook & call_api
+	Method HTTPMethod `json:"method,omitempty"` // "GET" | "POST"
 
-type CallAPIStep struct {
-	Method  HTTPMethod        `json:"method"`
-	URL     string            `json:"url"`
+	// webhook
+	Path string `json:"path,omitempty"`
+
+	// call_api
+	URL     string            `json:"url,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
 	Body    json.RawMessage   `json:"body,omitempty"`
 }
 
+// Step is a single unit of work inside a workflow.
+// ID is an 8-char hex (4 random bytes) — unique within a worker.
+// Name is optional, used only for logging.
 type Step struct {
-	Type    string       `json:"type"` // "webhook" | "log" | "call_api"
-	Webhook *WebhookStep `json:"webhook,omitempty"`
-	Log     *LogStep     `json:"log,omitempty"`
-	CallAPI *CallAPIStep `json:"call_api,omitempty"`
+	ID    string     `json:"id"`             // 8-char hex, auto-generated if empty
+	Name  string     `json:"name,omitempty"` // optional label
+	Type  string     `json:"type"`           // "log" | "webhook" | "call_api"
+	Value *StepValue `json:"value"`
 }
 
 // WorkerMode controls how a worker behaves after completing all steps.
@@ -333,22 +342,20 @@ func runWorker(ctx context.Context, w *Worker, _ *Store, hooks *webhookRouter) {
 			return
 		default:
 		}
+		if step.Value == nil {
+			log.Printf("[worker:%s][step:%s] skipped — nil value", w.ID, step.stepLabel())
+			continue
+		}
 		switch step.Type {
 		case "webhook":
-			if step.Webhook != nil {
-				pctx = execWebhook(ctx, w.ID, step.Webhook, hooks)
-			}
+			pctx = execWebhook(ctx, w.ID, step, hooks)
 		case "log":
-			if step.Log != nil {
-				msg := renderTemplate(step.Log.Message, pctx)
-				log.Printf("[worker:%s] LOG → %s", w.ID, msg)
-			}
+			msg := renderTemplate(step.Value.Message, pctx)
+			log.Printf("[worker:%s][step:%s] LOG → %s", w.ID, step.stepLabel(), msg)
 		case "call_api":
-			if step.CallAPI != nil {
-				execCallAPI(ctx, w.ID, step.CallAPI, pctx)
-			}
+			execCallAPI(ctx, w.ID, step, pctx)
 		default:
-			log.Printf("[worker:%s] unknown step type: %q", w.ID, step.Type)
+			log.Printf("[worker:%s][step:%s] unknown type: %q", w.ID, step.stepLabel(), step.Type)
 		}
 	}
 	log.Printf("[worker:%s] workflow completed", w.ID)
@@ -357,6 +364,14 @@ func runWorker(ctx context.Context, w *Worker, _ *Store, hooks *webhookRouter) {
 // ─────────────────────────────────────────────
 //  Step executors
 // ─────────────────────────────────────────────
+
+// stepLabel returns "name(id)" if name set, else just id — for log readability.
+func (s Step) stepLabel() string {
+	if s.Name != "" {
+		return s.Name + "(" + s.ID + ")"
+	}
+	return s.ID
+}
 
 // ─────────────────────────────────────────────
 //  Template rendering
@@ -403,10 +418,9 @@ func resolveKey(key string, data map[string]interface{}) interface{} {
 	return ""
 }
 
-func execWebhook(ctx context.Context, workerID string, cfg *WebhookStep, hooks *webhookRouter) pipelineCtx {
+func execWebhook(ctx context.Context, workerID string, step Step, hooks *webhookRouter) pipelineCtx {
+	cfg := step.Value
 	// Full path: /<workerID><path>
-	// e.g. workerID=a3f2c1d4, path=/hook/order -> /a3f2c1d4.../hook/order
-	// Guarantees no clash between workers sharing the same path string.
 	fullPath := "/" + workerID + cfg.Path
 
 	arrived := make(chan pipelineCtx, 1)
@@ -415,19 +429,18 @@ func execWebhook(ctx context.Context, workerID string, cfg *WebhookStep, hooks *
 
 	select {
 	case pctx := <-arrived:
-		log.Printf("[worker:%s] WEBHOOK triggered, continuing workflow", workerID)
+		log.Printf("[worker:%s][step:%s] WEBHOOK triggered, continuing workflow", workerID, step.stepLabel())
 		return pctx
 	case <-ctx.Done():
-		log.Printf("[worker:%s] WEBHOOK cancelled", workerID)
+		log.Printf("[worker:%s][step:%s] WEBHOOK cancelled", workerID, step.stepLabel())
 		return pipelineCtx{Body: make(map[string]interface{}), Headers: make(map[string]string)}
 	}
 }
 
-func execCallAPI(ctx context.Context, workerID string, cfg *CallAPIStep, pctx pipelineCtx) {
-	// render URL
+func execCallAPI(ctx context.Context, workerID string, step Step, pctx pipelineCtx) {
+	cfg := step.Value
 	renderedURL := renderTemplate(cfg.URL, pctx)
 
-	// render body: replace {{.field}} inside raw JSON string
 	var reqBody io.Reader
 	if len(cfg.Body) > 0 {
 		renderedBody := renderTemplate(string(cfg.Body), pctx)
@@ -435,7 +448,7 @@ func execCallAPI(ctx context.Context, workerID string, cfg *CallAPIStep, pctx pi
 	}
 	req, err := http.NewRequestWithContext(ctx, string(cfg.Method), renderedURL, reqBody)
 	if err != nil {
-		log.Printf("[worker:%s] CALL_API build error: %v", workerID, err)
+		log.Printf("[worker:%s][step:%s] CALL_API build error: %v", workerID, step.stepLabel(), err)
 		return
 	}
 	if len(cfg.Body) > 0 {
@@ -446,13 +459,13 @@ func execCallAPI(ctx context.Context, workerID string, cfg *CallAPIStep, pctx pi
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Printf("[worker:%s] CALL_API error: %v", workerID, err)
+		log.Printf("[worker:%s][step:%s] CALL_API error: %v", workerID, step.stepLabel(), err)
 		return
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
-	log.Printf("[worker:%s] CALL_API %s %s → HTTP %d | %s",
-		workerID, cfg.Method, cfg.URL, resp.StatusCode, string(respBody))
+	log.Printf("[worker:%s][step:%s] CALL_API %s %s → HTTP %d | %s",
+		workerID, step.stepLabel(), cfg.Method, cfg.URL, resp.StatusCode, string(respBody))
 }
 
 // ─────────────────────────────────────────────
@@ -488,6 +501,16 @@ func uniqueID() string {
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
+// stepID returns an 8-char hex string (4 random bytes).
+// Unique within a worker scope — short and readable in logs.
+func stepID() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%08x", time.Now().UnixNano()&0xffffffff)
+	}
+	return fmt.Sprintf("%08x", b)
+}
+
 // POST /create
 func (a *App) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -501,6 +524,11 @@ func (a *App) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if worker.ID == "" {
 		worker.ID = uniqueID()
+	}
+	for i := range worker.Steps {
+		if worker.Steps[i].ID == "" {
+			worker.Steps[i].ID = stepID()
+		}
 	}
 	worker.Created = time.Now()
 	worker.Updated = time.Now()
@@ -556,6 +584,11 @@ func (a *App) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if wasRunning && !reflect.DeepEqual(existing.Steps, updated.Steps) {
 		a.runtime.Stop(updated.ID)
 		wasRunning = false
+	}
+	for i := range updated.Steps {
+		if updated.Steps[i].ID == "" {
+			updated.Steps[i].ID = stepID()
+		}
 	}
 	if err := a.store.Save(&updated); err != nil {
 		errJSON(w, http.StatusInternalServerError, err.Error())

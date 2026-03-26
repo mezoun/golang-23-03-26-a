@@ -21,6 +21,7 @@ implementasi `rancangan_membuat_agent.md` di atas engine `main.go`.
 | Critics Step 17-24 | `call_api` (8b) + `branch` | Quality gate |
 | Nutrition/Plating/Variations Step 25-27 | `call_api` (70b) | |
 | Final Polish Step 28 | `call_api` (8b) | |
+| **Save to File Step 28b** | **`call_api` → `/files/save`** | **Auto-simpan ke `output/`, return `view_url`** |
 
 > **Catatan loop feedback:** rancangan max 3 iterasi → diimplementasikan sebagai 1× retry via `branch` (quality gate). Jump limit engine = 1000, cukup aman.
 
@@ -416,11 +417,27 @@ cat > recipe-agent.json << 'ENDJSON'
     },
 
     {
+      "id":   "s16b_save_file",
+      "name": "16b – Save Result to File (output folder)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "http://localhost:8080/files/save",
+        "headers": { "Content-Type": "application/json" },
+        "body": {
+          "tag":     "recipe",
+          "content": "{{json:s16_final_polish.result.response}}"
+        },
+        "retry": { "max": 2, "delay_ms": 500, "backoff": false }
+      }
+    },
+
+    {
       "id":   "s17_log_result",
       "name": "17 – Log Final Recipe",
       "type": "log",
       "value": {
-        "message": "RECIPE_DONE | input={{s01_webhook.input}} | critics_avg={{s12_critics.result.response}} | final_json={{s16_final_polish.result.response}}"
+        "message": "RECIPE_DONE | input={{s01_webhook.input}} | critics_avg={{s12_critics.result.response}} | file={{s16b_save_file.result.response}}"
       }
     },
 
@@ -429,7 +446,7 @@ cat > recipe-agent.json << 'ENDJSON'
       "name": "18 – Run Complete (juga menangani unknown input)",
       "type": "log",
       "value": {
-        "message": "RUN_COMPLETE | worker=recipe-agent-v1 | input={{s01_webhook.input}} | detected_type={{s02_detect.result.response}}"
+        "message": "RUN_COMPLETE | worker=recipe-agent-v1 | input={{s01_webhook.input}} | detected_type={{s02_detect.result.response}} | saved_file={{s16b_save_file.result.response}}"
       }
     }
 
@@ -516,7 +533,71 @@ curl -s -X POST http://localhost:8080/recipe-agent-v1/recipe \
 
 ---
 
-## 7. 📊 CEK STATUS WORKER
+## 7. 💾 FILE HASIL AGENT
+
+### 7a. Lihat semua file hasil agent
+
+```bash
+# List semua file di folder output (termasuk hasil agent)
+curl -s http://localhost:8080/files/list | jq '[.[] | select(.name | startswith("agent-"))]'
+```
+
+**Contoh output:**
+```json
+[
+  {
+    "name": "agent-recipe_20250326-143022_a1b2c3d4.json",
+    "size_bytes": 3821,
+    "modified": "2025-03-26T14:30:22Z"
+  }
+]
+```
+
+### 7b. Download / lihat isi file hasil agent
+
+```bash
+# Download langsung ke file lokal (nama otomatis sesuai server)
+curl -O -J "http://localhost:8080/files/view?name=agent-recipe_20250326-143022_a1b2c3d4.json"
+
+# Atau tampilkan ke stdout dan format dengan jq
+curl -s "http://localhost:8080/files/view?name=agent-recipe_20250326-143022_a1b2c3d4.json" | jq .
+```
+
+### 7c. Simpan manual ke output folder (untuk testing / embed sistem lain)
+
+Endpoint `POST /files/save` bisa dipanggil dari luar agent (curl biasa):
+
+```bash
+curl -s -X POST http://localhost:8080/files/save \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tag": "recipe",
+    "content": "{\"title\":\"Rendang\",\"description\":\"Masakan khas Minang\"}"
+  }' | jq .
+```
+
+**Response (HTTP 201):**
+```json
+{
+  "name": "agent-recipe_20250326-143055_ff1a2b3c.json",
+  "size_bytes": 61,
+  "view_url": "/files/view?name=agent-recipe_20250326-143055_ff1a2b3c.json"
+}
+```
+
+> **Konvensi nama file:**  
+> `agent-{tag}_{YYYYMMDD-HHMMSS}_{rand8hex}.json`  
+> Awalan `agent-` memudahkan filter di `/files/list`. `tag` boleh kosong → `agent_{ts}_{rand}.json`.
+
+### 7d. Hapus file hasil agent
+
+```bash
+curl -s -X DELETE "http://localhost:8080/files/delete?name=agent-recipe_20250326-143022_a1b2c3d4.json" | jq .
+```
+
+---
+
+## 8. 📊 CEK STATUS WORKER
 
 ```bash
 curl -s "http://localhost:8080/status?id=recipe-agent-v1" | jq .
@@ -536,7 +617,7 @@ curl -s "http://localhost:8080/status?id=recipe-agent-v1" | jq .
 
 ---
 
-## 8. 📋 GET DEFINISI WORKER
+## 9. 📋 GET DEFINISI WORKER
 
 ```bash
 curl -s "http://localhost:8080/get?id=recipe-agent-v1" | jq .
@@ -544,7 +625,7 @@ curl -s "http://localhost:8080/get?id=recipe-agent-v1" | jq .
 
 ---
 
-## 9. 📋 LIST SEMUA WORKERS
+## 10. 📋 LIST SEMUA WORKERS
 
 ```bash
 curl -s http://localhost:8080/list | jq '[.[] | {id, name, mode, running}]'
@@ -552,7 +633,7 @@ curl -s http://localhost:8080/list | jq '[.[] | {id, name, mode, running}]'
 
 ---
 
-## 10. ⏹️ STOP WORKER
+## 11. ⏹️ STOP WORKER
 
 ```bash
 curl -s -X POST "http://localhost:8080/stop?id=recipe-agent-v1" | jq .
@@ -565,7 +646,7 @@ curl -s -X POST "http://localhost:8080/stop?id=recipe-agent-v1" | jq .
 
 ---
 
-## 11. ▶️ RESUME WORKER (tanpa update definisi)
+## 12. ▶️ RESUME WORKER (tanpa update definisi)
 
 ```bash
 curl -s -X POST "http://localhost:8080/run?id=recipe-agent-v1" | jq .
@@ -578,7 +659,7 @@ curl -s -X POST "http://localhost:8080/run?id=recipe-agent-v1" | jq .
 
 ---
 
-## 12. ✏️ UPDATE VARS (ganti token tanpa restart steps)
+## 13. ✏️ UPDATE VARS (ganti token tanpa restart steps)
 
 Update vars saja — engine otomatis me-refresh vars tiap iterasi loop.
 
@@ -603,7 +684,7 @@ curl -s -X PUT http://localhost:8080/update \
 
 ---
 
-## 13. 🗑️ DELETE WORKER
+## 14. 🗑️ DELETE WORKER
 
 ```bash
 curl -s -X DELETE "http://localhost:8080/delete?id=recipe-agent-v1" | jq .
@@ -636,8 +717,9 @@ Setelah mengirim webhook, pantau log server. Urutan yang benar:
 [worker:recipe-agent-v1][step:13 – Quality Gate(s13_quality_gate)]     BRANCH → goto s14 (retry) ATAU goto s15 (ok)
 [worker:recipe-agent-v1][step:15 – Nutrition+Vars(s15_nutrition_vars)] CALL_API POST ...70b... → HTTP 200
 [worker:recipe-agent-v1][step:16 – Final Polish(s16_final_polish)]     CALL_API POST ...8b... → HTTP 200
-[worker:recipe-agent-v1][step:17 – Log Final(s17_log_result)]          LOG → RECIPE_DONE | ...
-[worker:recipe-agent-v1][step:18 – Run Complete(s18_run_complete)]     LOG → RUN_COMPLETE | ...
+[worker:recipe-agent-v1][step:16b – Save Result(s16b_save_file)]       CALL_API POST /files/save → HTTP 201 {"name":"agent-recipe_20250326-143022_a1b2c3d4.json","view_url":"/files/view?name=agent-recipe_..."}
+[worker:recipe-agent-v1][step:17 – Log Final(s17_log_result)]          LOG → RECIPE_DONE | ... | file={"name":"agent-recipe_...","view_url":"..."}
+[worker:recipe-agent-v1][step:18 – Run Complete(s18_run_complete)]     LOG → RUN_COMPLETE | ... | saved_file={"name":"agent-recipe_...","view_url":"..."}
 [worker:recipe-agent-v1] workflow completed
 ```
 

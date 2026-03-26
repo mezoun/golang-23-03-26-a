@@ -72,7 +72,8 @@ const (
 
 	// File manager — output folder
 	outputDir      = "output"
-	maxUploadBytes = 10 << 20 // 10 MB per file (aman untuk 1 GB RAM + banyak worker)
+	maxUploadBytes = 10 << 20 // 10 MB per file (multipart upload)
+	maxSaveBytes   = 5 << 20  // 5 MB per save — agent output biasanya < 1 MB
 	maxOutputFiles = 200      // max file di folder output
 	maxListFiles   = 500      // batas iterasi ReadDir
 
@@ -1628,7 +1629,123 @@ func (a *App) handleFileView(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, fpath)
 }
 
-// DELETE /files/delete?name=<filename>
+// generateAgentFilename menghasilkan nama file unik untuk hasil agent.
+// Format: agent-{tag}_{YYYYMMDD-HHMMSS}_{rand8hex}.json
+// Jika tag kosong: agent_{YYYYMMDD-HHMMSS}_{rand8hex}.json
+func generateAgentFilename(tag string) string {
+	ts := time.Now().Format("20060102-150405")
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		b[0] = byte(time.Now().UnixNano())
+	}
+	randPart := fmt.Sprintf("%08x", b)
+	if tag == "" {
+		return fmt.Sprintf("agent_%s_%s.json", ts, randPart)
+	}
+	// Bersihkan tag: hanya huruf, angka, dash
+	var clean []byte
+	for _, c := range []byte(tag) {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '-' {
+			clean = append(clean, c)
+		}
+	}
+	if len(clean) == 0 {
+		clean = []byte("agent")
+	}
+	if len(clean) > 32 {
+		clean = clean[:32]
+	}
+	return fmt.Sprintf("agent-%s_%s_%s.json", clean, ts, randPart)
+}
+
+// saveRequest adalah payload untuk /files/save.
+type saveRequest struct {
+	Tag     string `json:"tag"`     // opsional — label agent, muncul di nama file
+	Content string `json:"content"` // wajib — isi file (string/JSON)
+}
+
+// POST /files/save
+// Menerima JSON body dan menyimpan isinya ke folder output/ sebagai file baru.
+// Nama file di-generate otomatis agar unik dan jelas berasal dari agent.
+// Cocok dipanggil via call_api dari dalam pipeline worker.
+//
+// Request body:
+//
+//	{ "tag": "recipe", "content": "{\"title\":\"Sate Padang\",...}" }
+//
+// Response:
+//
+//	{ "name": "agent-recipe_20250326-143022_a1b2c3d4.json",
+//	  "size_bytes": 2345,
+//	  "view_url": "/files/view?name=agent-recipe_20250326-143022_a1b2c3d4.json" }
+//
+// Curl contoh (manual):
+//
+//	curl -s -X POST http://localhost:8080/files/save \
+//	     -H "Content-Type: application/json" \
+//	     -d '{"tag":"recipe","content":"{\"title\":\"Rendang\"}"}' | jq .
+func (a *App) handleFileSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errJSON(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	if !requireJSON(w, r) {
+		return
+	}
+
+	var req saveRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, int64(maxSaveBytes)+512)).Decode(&req); err != nil {
+		errJSON(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.Content == "" {
+		errJSON(w, http.StatusBadRequest, "field 'content' wajib ada dan tidak boleh kosong")
+		return
+	}
+	if len(req.Content) > maxSaveBytes {
+		errJSON(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("content terlalu besar (maks %d MB)", maxSaveBytes>>20))
+		return
+	}
+
+	if err := ensureOutputDir(); err != nil {
+		errJSON(w, http.StatusInternalServerError, "tidak dapat membuat folder output")
+		return
+	}
+
+	// Cek kuota file
+	entries, _ := os.ReadDir(outputDir)
+	fileCount := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			fileCount++
+		}
+	}
+	if fileCount >= maxOutputFiles {
+		errJSON(w, http.StatusInsufficientStorage,
+			fmt.Sprintf("folder output penuh (maks %d file)", maxOutputFiles))
+		return
+	}
+
+	filename := generateAgentFilename(req.Tag)
+	dstPath := filepath.Join(outputDir, filename)
+
+	if err := os.WriteFile(dstPath, []byte(req.Content), 0o644); err != nil {
+		errJSON(w, http.StatusInternalServerError, "gagal menyimpan file")
+		return
+	}
+
+	viewURL := "/files/view?name=" + filename
+	log.Printf("[files] save: %s (%d bytes) tag=%q", filename, len(req.Content), req.Tag)
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"name":       filename,
+		"size_bytes": len(req.Content),
+		"view_url":   viewURL,
+	})
+}
+
+// POST /files/delete?name=<filename>
 //
 // Curl contoh:
 //
@@ -1906,6 +2023,7 @@ func main() {
 	mux.HandleFunc("/files/list", app.handleFileList)
 	mux.HandleFunc("/files/view", app.handleFileView)
 	mux.HandleFunc("/files/delete", app.handleFileDelete)
+	mux.HandleFunc("/files/save", app.handleFileSave)
 	mux.Handle("/", hooks)
 
 	// FASE 3-F: Staggered start — jeda random antar worker saat boot

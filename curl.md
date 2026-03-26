@@ -1,166 +1,73 @@
-# Worker Engine — curl Demo: Branch / Percabangan
+# Worker Engine — Agentic AI: Resep Masakan (v2 — Fixed)
 
-Demonstrasi semua pola percabangan menggunakan step type `"branch"`.
-
----
-
-## Konsep Branch
-
-```
-"type": "branch"
-"value": {
-  "cases": [
-    { "when": { "left": "{{step.field}}", "op": "==", "right": "nilai" }, "goto": "step_id" },
-    { "when": { "left": "{{step.score}}", "op": ">=", "right": "90"    }, "goto": "step_id" },
-    { }   ← else: tanpa "when", selalu cocok, goto opsional
-  ]
-}
-```
-
-**Op yang tersedia:** `==` `!=` `>` `<` `>=` `<=` `contains` `starts_with` `ends_with`
-
-**Goto:** step ID tujuan. Kosong / tidak ada = lanjut sequential ke step berikutnya.
-
-**Urutan evaluasi:** case pertama yang cocok menang (if → elseif → elseif → else).
+Worker ini menerima input masakan dalam 3 bentuk berbeda (**deskripsi**, **judul**, atau **bahan**),
+routing ke agent AI yang sesuai, lalu AI validator memastikan output JSON lengkap 5 field.
 
 ---
 
-## Pola 1 — if / elseif / else (string)
+## Alur
 
-Webhook menerima `{"lang": "id"}` → branch ke log berbeda per bahasa.
+```
+webhook (input)
+    │
+    ▼
+branch (detect_type)
+    ├── type == "deskripsi"  ──► agent_deskripsi  ──┐
+    ├── type == "judul"      ──► agent_judul       ──┤  output map: agent_raw
+    ├── type == "bahan"      ──► agent_bahan       ──┘
+    └── else (undefined)     ──► log_undefined ──► end
+                                                     │
+                                                     ▼
+                                               parse_result  (AI validator)
+                                                     │
+                                                     ▼
+                                               log_result → end
+```
+
+---
+
+## CREATE WORKER
 
 ```bash
 curl -X POST http://localhost:8080/create \
   -H "Content-Type: application/json" \
   -d '{
-  "name": "Branch: if-elseif-else",
-  "mode": "loop",
-  "running": true,
-  "steps": [
-    {
-      "id": "hook",
-      "type": "webhook",
-      "value": { "method": "POST", "path": "/lang" }
-    },
-    {
-      "id": "check_lang",
-      "name": "cek bahasa",
-      "type": "branch",
-      "value": {
-        "cases": [
-          { "when": { "left": "{{hook.lang}}", "op": "==", "right": "id" }, "goto": "log_id" },
-          { "when": { "left": "{{hook.lang}}", "op": "==", "right": "en" }, "goto": "log_en" },
-          { "when": { "left": "{{hook.lang}}", "op": "==", "right": "jp" }, "goto": "log_jp" },
-          { "goto": "log_unknown" }
-        ]
-      }
-    },
-    { "id": "log_id",      "type": "log", "value": { "message": "Halo! Bahasa: {{hook.lang}}" },     "next": "log_done" },
-    { "id": "log_en",      "type": "log", "value": { "message": "Hello! Language: {{hook.lang}}" },   "next": "log_done" },
-    { "id": "log_jp",      "type": "log", "value": { "message": "こんにちは！言語: {{hook.lang}}" },  "next": "log_done" },
-    { "id": "log_unknown", "type": "log", "value": { "message": "Bahasa tidak dikenal: {{hook.lang}}" } },
-    { "id": "log_done",    "type": "log", "value": { "message": "Selesai proses bahasa {{hook.lang}}" } }
-  ]
-}'
-```
-
-Trigger (ganti `WORKER_ID`):
-
-```bash
-curl -X POST http://localhost:8080/WORKER_ID/lang \
-  -H "Content-Type: application/json" \
-  -d '{"lang": "id"}'
-```
-
-```bash
-curl -X POST http://localhost:8080/WORKER_ID/lang \
-  -H "Content-Type: application/json" \
-  -d '{"lang": "fr"}'
-```
-
----
-
-## Pola 2 — switch (numeric / skor)
-
-Webhook menerima `{"score": 85}` → cabang berbeda per rentang nilai.
-
-```bash
-curl -X POST http://localhost:8080/create \
-  -H "Content-Type: application/json" \
-  -d '{
-  "name": "Branch: numeric switch",
-  "mode": "loop",
-  "running": true,
-  "steps": [
-    {
-      "id": "hook",
-      "type": "webhook",
-      "value": { "method": "POST", "path": "/score" }
-    },
-    {
-      "id": "grade",
-      "name": "tentukan grade",
-      "type": "branch",
-      "value": {
-        "cases": [
-          { "when": { "left": "{{hook.score}}", "op": ">=", "right": "90" }, "goto": "grade_a" },
-          { "when": { "left": "{{hook.score}}", "op": ">=", "right": "75" }, "goto": "grade_b" },
-          { "when": { "left": "{{hook.score}}", "op": ">=", "right": "60" }, "goto": "grade_c" },
-          { "goto": "grade_d" }
-        ]
-      }
-    },
-    { "id": "grade_a", "type": "log", "value": { "message": "Score {{hook.score}} → Grade A (Sangat Baik)" }, "next": "selesai" },
-    { "id": "grade_b", "type": "log", "value": { "message": "Score {{hook.score}} → Grade B (Baik)" },       "next": "selesai" },
-    { "id": "grade_c", "type": "log", "value": { "message": "Score {{hook.score}} → Grade C (Cukup)" },      "next": "selesai" },
-    { "id": "grade_d", "type": "log", "value": { "message": "Score {{hook.score}} → Grade D (Kurang)" } },
-    { "id": "selesai", "type": "log", "value": { "message": "Evaluasi skor selesai." } }
-  ]
-}'
-```
-
-Trigger:
-
-```bash
-curl -X POST http://localhost:8080/WORKER_ID/score \
-  -H "Content-Type: application/json" \
-  -d '{"score": 92}'
-```
-
-```bash
-curl -X POST http://localhost:8080/WORKER_ID/score \
-  -H "Content-Type: application/json" \
-  -d '{"score": 55}'
-```
-
----
-
-## Pola 3 — branch berdasarkan response API (contains)
-
-Branch berdasarkan konten text dari respons AI / API eksternal.
-
-```bash
-curl -X POST http://localhost:8080/create \
-  -H "Content-Type: application/json" \
-  -d '{
-  "name": "Branch: API response contains",
+  "name": "Agentic AI: Resep Masakan v2",
   "mode": "loop",
   "running": true,
   "vars": {
-    "pvt": { "cf_id": "YOUR_CF_ACCOUNT_ID", "cf_auth": "YOUR_CF_TOKEN" },
     "glb": {
-      "model":   "@cf/meta/llama-3.1-8b-instruct-fast",
-      "api_url": "https://api.cloudflare.com/client/v4/accounts/{{pvt.cf_id}}/ai/run/{{glb.model}}"
+      "ai_model": "@cf/meta/llama-3.1-8b-instruct-fast",
+      "api_url": "https://api.cloudflare.com/client/v4/accounts/{{pvt.cf_id}}/ai/run/{{glb.ai_model}}"
+    },
+    "pvt": {
+      "cf_id": "56667d302adadb8e04093b1aac32017c",
+      "cf_auth": "cfut_KpdkVf3ZkIArmKDoBLQySa2TA4Pb5MXY4ZkXA7Qbe21abbbf"
     }
   },
   "steps": [
     {
-      "id": "hook",
+      "id": "input",
+      "name": "Terima Input Pengguna",
       "type": "webhook",
-      "value": { "method": "POST", "path": "/classify" }
+      "value": { "method": "POST", "path": "/masakan" }
     },
     {
-      "id": "ai",
+      "id": "detect_type",
+      "name": "Deteksi Tipe Input",
+      "type": "branch",
+      "value": {
+        "cases": [
+          { "when": { "left": "{{input.type}}", "op": "==", "right": "deskripsi" }, "goto": "agent_deskripsi" },
+          { "when": { "left": "{{input.type}}", "op": "==", "right": "judul"     }, "goto": "agent_judul"     },
+          { "when": { "left": "{{input.type}}", "op": "==", "right": "bahan"     }, "goto": "agent_bahan"     },
+          { "goto": "log_undefined" }
+        ]
+      }
+    },
+    {
+      "id": "agent_deskripsi",
+      "name": "Agent AI — dari Deskripsi",
       "type": "call_api",
       "value": {
         "method": "POST",
@@ -170,131 +77,209 @@ curl -X POST http://localhost:8080/create \
           "messages": [
             {
               "role": "system",
-              "content": "Klasifikasikan pertanyaan berikut. Jawab HANYA dengan satu kata: FOOD, TECH, atau OTHER."
+              "content": "Kamu adalah chef AI yang ahli masakan Indonesia dan internasional. Pengguna memberikan DESKRIPSI masakan yang diinginkan. Tugasmu: buat resep lengkap berdasarkan deskripsi tersebut. WAJIB jawab HANYA dengan JSON valid, tanpa teks tambahan, tanpa markdown. Format: {\"judul\":\"nama masakan\",\"deskripsi\":\"deskripsi singkat masakan\",\"bahan\":\"daftar bahan dan takaran\",\"cara_masak\":\"langkah memasak\",\"saran_penyajian\":\"saran penyajian\"}"
             },
-            { "role": "user", "content": "{{hook.question}}" }
+            {
+              "role": "user",
+              "content": "Buat resep berdasarkan deskripsi ini: {{input.data}}"
+            }
           ]
         }
       },
-      "output": { "category": "{{ai.result.response}}" }
+      "output": { "agent_raw": "{{agent_deskripsi.result.response}}" },
+      "next": "parse_result"
     },
     {
-      "id": "route",
-      "name": "routing kategori",
-      "type": "branch",
-      "value": {
-        "cases": [
-          { "when": { "left": "{{ai.category}}", "op": "contains", "right": "FOOD" }, "goto": "ans_food" },
-          { "when": { "left": "{{ai.category}}", "op": "contains", "right": "TECH" }, "goto": "ans_tech" },
-          { "goto": "ans_other" }
-        ]
-      }
-    },
-    { "id": "ans_food",  "type": "log", "value": { "message": "[FOOD] Q: {{hook.question}} | cat: {{ai.category}}" },  "next": "done" },
-    { "id": "ans_tech",  "type": "log", "value": { "message": "[TECH] Q: {{hook.question}} | cat: {{ai.category}}" },  "next": "done" },
-    { "id": "ans_other", "type": "log", "value": { "message": "[OTHER] Q: {{hook.question}} | cat: {{ai.category}}" } },
-    { "id": "done",      "type": "log", "value": { "message": "Routing selesai untuk: {{hook.question}}" } }
-  ]
-}'
-```
-
-Trigger:
-
-```bash
-curl -X POST http://localhost:8080/WORKER_ID/classify \
-  -H "Content-Type: application/json" \
-  -d '{"question": "Resep nasi goreng terenak?"}'
-```
-
-```bash
-curl -X POST http://localhost:8080/WORKER_ID/classify \
-  -H "Content-Type: application/json" \
-  -d '{"question": "Apa itu Kubernetes?"}'
-```
-
----
-
-## Pola 4 — branch berdasarkan success/gagal API
-
-Cek `{{ai.success}}` true/false → handling error eksplisit.
-
-```bash
-curl -X POST http://localhost:8080/create \
-  -H "Content-Type: application/json" \
-  -d '{
-  "name": "Branch: API success check",
-  "mode": "loop",
-  "running": true,
-  "vars": {
-    "pvt": { "cf_id": "YOUR_CF_ACCOUNT_ID", "cf_auth": "YOUR_CF_TOKEN" },
-    "glb": {
-      "model":   "@cf/meta/llama-3.1-8b-instruct-fast",
-      "api_url": "https://api.cloudflare.com/client/v4/accounts/{{pvt.cf_id}}/ai/run/{{glb.model}}"
-    }
-  },
-  "steps": [
-    {
-      "id": "hook",
-      "type": "webhook",
-      "value": { "method": "POST", "path": "/ask" }
-    },
-    {
-      "id": "ai",
+      "id": "agent_judul",
+      "name": "Agent AI — dari Judul",
       "type": "call_api",
       "value": {
         "method": "POST",
         "url": "{{glb.api_url}}",
         "headers": { "Authorization": "Bearer {{pvt.cf_auth}}" },
         "body": {
-          "messages": [{ "role": "user", "content": "{{hook.question}}" }]
+          "messages": [
+            {
+              "role": "system",
+              "content": "Kamu adalah chef AI yang ahli masakan Indonesia dan internasional. Pengguna memberikan NAMA/JUDUL masakan. Tugasmu: buat resep lengkap untuk masakan tersebut. WAJIB jawab HANYA dengan JSON valid, tanpa teks tambahan, tanpa markdown. Format: {\"judul\":\"nama masakan\",\"deskripsi\":\"deskripsi singkat masakan\",\"bahan\":\"daftar bahan dan takaran\",\"cara_masak\":\"langkah memasak\",\"saran_penyajian\":\"saran penyajian\"}"
+            },
+            {
+              "role": "user",
+              "content": "Buat resep lengkap untuk masakan: {{input.data}}"
+            }
+          ]
         }
       },
-      "output": {
-        "answer":  "{{ai.result.response}}",
-        "success": "{{ai.success}}"
-      }
+      "output": { "agent_raw": "{{agent_judul.result.response}}" },
+      "next": "parse_result"
     },
     {
-      "id": "check_ok",
-      "name": "cek hasil AI",
-      "type": "branch",
+      "id": "agent_bahan",
+      "name": "Agent AI — dari Bahan",
+      "type": "call_api",
       "value": {
-        "cases": [
-          { "when": { "left": "{{ai.success}}", "op": "==", "right": "true" }, "goto": "log_ok" },
-          { "goto": "log_err" }
-        ]
-      }
+        "method": "POST",
+        "url": "{{glb.api_url}}",
+        "headers": { "Authorization": "Bearer {{pvt.cf_auth}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "Kamu adalah chef AI yang ahli masakan Indonesia dan internasional. Pengguna memberikan daftar BAHAN yang tersedia. Tugasmu: rekomendasikan dan buat resep masakan terbaik dari bahan-bahan tersebut. WAJIB jawab HANYA dengan JSON valid, tanpa teks tambahan, tanpa markdown. Format: {\"judul\":\"nama masakan\",\"deskripsi\":\"deskripsi singkat masakan\",\"bahan\":\"daftar bahan dan takaran\",\"cara_masak\":\"langkah memasak\",\"saran_penyajian\":\"saran penyajian\"}"
+            },
+            {
+              "role": "user",
+              "content": "Bahan yang saya punya: {{input.data}}. Rekomendasikan dan buat resep masakan dari bahan ini."
+            }
+          ]
+        }
+      },
+      "output": { "agent_raw": "{{agent_bahan.result.response}}" },
+      "next": "parse_result"
     },
-    { "id": "log_ok",  "type": "log", "value": { "message": "[OK]  Q: {{hook.question}} | A: {{ai.answer}}" }, "next": "done" },
-    { "id": "log_err", "type": "log", "value": { "message": "[ERR] API gagal untuk: {{hook.question}}" } },
-    { "id": "done",    "type": "log", "value": { "message": "Request selesai." } }
+    {
+      "id": "log_undefined",
+      "name": "Tipe Input Tidak Dikenal",
+      "type": "log",
+      "value": {
+        "message": "[UNDEFINED] Tipe tidak dikenal: \"{{input.type}}\" | data: \"{{input.data}}\" | Gunakan type: deskripsi / judul / bahan"
+      },
+      "next": "end"
+    },
+    {
+      "id": "parse_result",
+      "name": "Agent AI — Validator dan Formatter",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{glb.api_url}}",
+        "headers": { "Authorization": "Bearer {{pvt.cf_auth}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "Kamu adalah JSON validator dan formatter. Input adalah teks yang seharusnya berisi JSON resep masakan. Tugasmu: pastikan output adalah JSON valid dengan tepat 5 field: judul, deskripsi, bahan, cara_masak, saran_penyajian. Jika sudah valid kembalikan apa adanya. Jika ada field hilang tambahkan. Jika ada teks di luar JSON buang. WAJIB jawab HANYA dengan JSON murni, TANPA markdown, TANPA backtick, TANPA teks apapun."
+            },
+            {
+              "role": "user",
+              "content": "Validasi dan format JSON ini: {{agent_deskripsi.agent_raw}}{{agent_judul.agent_raw}}{{agent_bahan.agent_raw}}"
+            }
+          ]
+        }
+      },
+      "output": { "final": "{{parse_result.result.response}}" },
+      "next": "log_result"
+    },
+    {
+      "id": "log_result",
+      "name": "Output Akhir Resep",
+      "type": "log",
+      "value": {
+        "message": "[RESEP] type={{input.type}} | input={{input.data}} | result={{parse_result.final}}"
+      },
+      "next": "end"
+    },
+    {
+      "id": "end",
+      "name": "Selesai",
+      "type": "log",
+      "value": { "message": "[END] Menunggu input berikutnya..." }
+    }
   ]
 }'
 ```
 
-Trigger:
+> Catat `"id"` dari response JSON → pakai sebagai `WORKER_ID` di bawah.
+
+---
+
+## TRIGGER WEBHOOK
+
+Ganti `WORKER_ID` dengan ID dari response `/create`.
+
+### Test 1 — Input tipe `deskripsi`
 
 ```bash
-curl -X POST http://localhost:8080/WORKER_ID/ask \
+curl -X POST http://localhost:8080/WORKER_ID/masakan \
   -H "Content-Type: application/json" \
-  -d '{"question": "Ibu kota Indonesia?"}'
+  -d '{
+  "type": "deskripsi",
+  "data": "Masakan pedas manis dengan protein tinggi, cocok untuk sarapan, menggunakan telur dan cabai"
+}'
+```
+
+### Test 2 — Input tipe `judul`
+
+```bash
+curl -X POST http://localhost:8080/WORKER_ID/masakan \
+  -H "Content-Type: application/json" \
+  -d '{
+  "type": "judul",
+  "data": "Rendang Daging Sapi"
+}'
+```
+
+### Test 3 — Input tipe `bahan`
+
+```bash
+curl -X POST http://localhost:8080/WORKER_ID/masakan \
+  -H "Content-Type: application/json" \
+  -d '{
+  "type": "bahan",
+  "data": "ayam kampung, santan, serai, daun salam, lengkuas, bawang merah, bawang putih, kemiri, kunyit"
+}'
+```
+
+### Test 4 — Tipe `undefined` (edge case)
+
+```bash
+curl -X POST http://localhost:8080/WORKER_ID/masakan \
+  -H "Content-Type: application/json" \
+  -d '{
+  "type": "foto",
+  "data": "gambar nasi goreng"
+}'
 ```
 
 ---
 
-## Ringkasan: Semua Operator
+## Catatan Fix: Aturan `output` Mapping
 
-| Operator | Tipe | Contoh |
-|---|---|---|
-| `==` | string / numeric | `"left": "{{hook.lang}}", "op": "==", "right": "id"` |
-| `!=` | string / numeric | `"left": "{{hook.status}}", "op": "!=", "right": "error"` |
-| `>` | numeric | `"left": "{{hook.score}}", "op": ">", "right": "90"` |
-| `<` | numeric | `"left": "{{hook.age}}", "op": "<", "right": "18"` |
-| `>=` | numeric | `"left": "{{hook.score}}", "op": ">=", "right": "75"` |
-| `<=` | numeric | `"left": "{{hook.score}}", "op": "<=", "right": "100"` |
-| `contains` | string | `"left": "{{ai.result}}", "op": "contains", "right": "error"` |
-| `starts_with` | string | `"left": "{{hook.url}}", "op": "starts_with", "right": "https"` |
-| `ends_with` | string | `"left": "{{hook.file}}", "op": "ends_with", "right": ".pdf"` |
+### ❌ Bug sebelumnya — self-reference di parse_result
 
-> **Note:** `>` `<` `>=` `<=` otomatis numeric jika kedua sisi bisa di-parse sebagai angka.
-> Jika tidak bisa (misal membandingkan string), fallback ke string comparison (lexicographic).
+```json
+"output": { "full_response": "{{parse_result.result.response}}" }
+```
+Step `parse_result` membaca dari dirinya sendiri setelah `pctx` di-override → selalu kosong.
+
+### ✅ Fix — output mapping di masing-masing agent
+
+```json
+// agent_deskripsi: baca raw response SEBELUM pctx di-override
+"output": { "agent_raw": "{{agent_deskripsi.result.response}}" }
+
+// parse_result: baca dari agent yg sudah selesai (sudah ada di pctx)
+"output": { "final": "{{parse_result.result.response}}" }
+```
+
+**Aturan:** field `output` pada step X boleh self-reference ke `{{X.field}}` karena
+raw API response masuk ke pctx lebih dulu, baru output mapping meng-override.
+Yang tidak boleh adalah membaca step **lain** yang belum dieksekusi.
+
+Di step `parse_result`, input AI menggunakan:
+```
+{{agent_deskripsi.agent_raw}}{{agent_judul.agent_raw}}{{agent_bahan.agent_raw}}
+```
+Hanya **satu** yang berisi nilai (agent yang dieksekusi branch), dua lainnya kosong string — ini disengaja dan benar.
+
+---
+
+## Expected Log (saat berhasil)
+
+```
+[worker:ID][step:Deteksi Tipe Input] BRANCH case[1] match ("judul" == "judul") → goto "agent_judul"
+[worker:ID][step:Agent AI — dari Judul] CALL_API POST https://api.cloudflare.com/... → HTTP 200 | {"result":{"response":"{\"judul\":\"Rendang..."}...}
+[worker:ID][step:Agent AI — Validator dan Formatter] CALL_API POST ... → HTTP 200 | ...
+[worker:ID][step:Output Akhir Resep] LOG → [RESEP] type=judul | input=Rendang Daging Sapi | result={"judul":"Rendang Daging Sapi","deskripsi":"...","bahan":"...","cara_masak":"...","saran_penyajian":"..."}
+[worker:ID][step:Selesai] LOG → [END] Menunggu input berikutnya...
+```

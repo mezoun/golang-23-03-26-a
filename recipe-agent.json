@@ -1,0 +1,571 @@
+{
+  "id": "recipe-agent-v1",
+  "name": "Recipe Generator Agent",
+  "mode": "loop",
+  "loop_interval_ms": 1000,
+  "running": true,
+  "vars": {
+    "cf": {
+      "token": "Bearer cfut_KpdkVf3ZkIArmKDoBLQySa2TA4Pb5MXY4ZkXA7Qbe21abbbf",
+      "url_8b": "https://api.cloudflare.com/client/v4/accounts/56667d302adadb8e04093b1aac32017c/ai/run/@cf/meta/llama-3.1-8b-instruct-fast",
+      "url_70b": "https://api.cloudflare.com/client/v4/accounts/56667d302adadb8e04093b1aac32017c/ai/run/@cf/meta/llama-3.1-70b-instruct"
+    }
+  },
+  "steps": [
+    {
+      "id": "s01_webhook",
+      "name": "01 – Receive Input",
+      "type": "webhook",
+      "value": {
+        "method": "POST",
+        "path": "/recipe"
+      }
+    },
+    {
+      "id": "s02_detect",
+      "name": "02 – Input Classification (8b-fast)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{cf.url_8b}}",
+        "headers": {
+          "Authorization": "{{cf.token}}"
+        },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a culinary input classifier. Analyze the user input and respond ONLY with a compact JSON object — no markdown, no extra text: {\"type\":\"title|ingredients|description|combination|unknown\"}. Rules: title=single dish name only. ingredients=comma or newline separated ingredient list. description=narrative paragraph longer than 30 words. combination=two or more of the above. unknown=non-food gibberish that cannot be interpreted as any recipe element."
+            },
+            {
+              "role": "user",
+              "content": "{{json:s01_webhook.input}}"
+            }
+          ],
+          "max_tokens": 512
+        },
+        "retry": {
+          "max": 1,
+          "delay_ms": 500,
+          "backoff": false
+        }
+      }
+    },
+    {
+      "id": "s03_branch_type",
+      "name": "03 – Route: unknown → skip pipeline",
+      "type": "branch",
+      "value": {
+        "cases": [
+          {
+            "when": {
+              "left": "{{s02_detect.result.response}}",
+              "op": "contains",
+              "right": "unknown"
+            },
+            "goto": "s18_run_complete"
+          }
+        ]
+      }
+    },
+    {
+      "id": "s04_enrich",
+      "name": "04 – Enrichment: fill missing fields (70b)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{cf.url_70b}}",
+        "headers": {
+          "Authorization": "{{cf.token}}"
+        },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a culinary expert specializing in Indonesian and Asian cuisine. From partial food input, infer ALL missing parts and output ONLY valid JSON — no markdown, no explanation: {\"title\":\"dish name\",\"description\":\"2–3 sentence description in Indonesian\",\"ingredients\":[\"ingredient with quantity\",\"...\"]}"
+            },
+            {
+              "role": "user",
+              "content": "Detected input type: {{json:s02_detect.result.response}}\nRaw input: {{json:s01_webhook.input}}"
+            }
+          ],
+          "max_tokens": 1024
+        },
+        "retry": {
+          "max": 2,
+          "delay_ms": 1000,
+          "backoff": true
+        }
+      }
+    },
+    {
+      "id": "s05_validate",
+      "name": "05 – Validator: check & consolidate JSON (8b-fast)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{cf.url_8b}}",
+        "headers": {
+          "Authorization": "{{cf.token}}"
+        },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a strict JSON validator. Verify the input JSON contains all required keys: title (non-empty string), description (non-empty string), ingredients (non-empty array of strings). If valid, output the EXACT same JSON unchanged. If any key is missing or empty, add it with a sensible culinary default. Output ONLY valid JSON — no markdown."
+            },
+            {
+              "role": "user",
+              "content": "{{json:s04_enrich.result.response}}"
+            }
+          ],
+          "max_tokens": 512
+        },
+        "retry": {
+          "max": 1,
+          "delay_ms": 500,
+          "backoff": false
+        }
+      }
+    },
+    {
+      "id": "s06_context",
+      "name": "06 – Context Enricher: intent, difficulty, equipment (70b)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{cf.url_70b}}",
+        "headers": {
+          "Authorization": "{{cf.token}}"
+        },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a culinary context analyzer. Enrich the recipe base data with cooking context. Output ONLY valid JSON — no markdown: {\"title\":\"...\",\"description\":\"...\",\"ingredients\":[...],\"difficulty\":\"easy|medium|hard\",\"equipment\":[\"...\"],\"serving_size\":\"N porsi\",\"prep_time_min\":0,\"cook_time_min\":0,\"cuisine_type\":\"...\",\"meal_type\":\"breakfast|lunch|dinner|snack|dessert\"}"
+            },
+            {
+              "role": "user",
+              "content": "{{json:s05_validate.result.response}}"
+            }
+          ],
+          "max_tokens": 1024
+        },
+        "retry": {
+          "max": 2,
+          "delay_ms": 1000,
+          "backoff": true
+        }
+      }
+    },
+    {
+      "id": "s07_domain",
+      "name": "07 – Domain Agents: ingredient + cultural + health + budget (70b)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{cf.url_70b}}",
+        "headers": {
+          "Authorization": "{{cf.token}}"
+        },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a multi-domain culinary analyst covering 4 specializations simultaneously: (1) Ingredient Realism — are all ingredients real and available in Indonesia? (2) Cultural Authenticity — cultural context and notes. (3) Health Analysis — health benefits and cautions. (4) Budget Estimation — cost tier. Output ONLY valid JSON — no markdown: {\"ingredient_check\":{\"all_realistic\":true,\"substitutions\":{}},\"cultural_notes\":\"...\",\"health_notes\":\"...\",\"allergens\":[\"...\"],\"budget\":\"low|medium|high\",\"estimated_cost_idr\":0}"
+            },
+            {
+              "role": "user",
+              "content": "{{json:s06_context.result.response}}"
+            }
+          ],
+          "max_tokens": 1024
+        },
+        "retry": {
+          "max": 2,
+          "delay_ms": 1000,
+          "backoff": true
+        }
+      }
+    },
+    {
+      "id": "s08_fusion",
+      "name": "08 – First Fusion + Hallucination Guard (8b-fast)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{cf.url_8b}}",
+        "headers": {
+          "Authorization": "{{cf.token}}"
+        },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a data fusion agent. Merge two JSON inputs (context enricher + domain analysis) into one coherent, hallucination-free recipe object. Remove any ingredient or step that does not make culinary sense. Output ONLY valid JSON — no markdown: {\"title\":\"...\",\"description\":\"...\",\"ingredients\":[...],\"difficulty\":\"...\",\"equipment\":[...],\"prep_time_min\":0,\"cook_time_min\":0,\"serving_size\":\"...\",\"cuisine_type\":\"...\",\"meal_type\":\"...\",\"cultural_notes\":\"...\",\"health_notes\":\"...\",\"allergens\":[...],\"budget\":\"...\",\"estimated_cost_idr\":0}"
+            },
+            {
+              "role": "user",
+              "content": "Context JSON: {{json:s06_context.result.response}}\nDomain JSON: {{json:s07_domain.result.response}}"
+            }
+          ],
+          "max_tokens": 1024
+        },
+        "retry": {
+          "max": 1,
+          "delay_ms": 500,
+          "backoff": false
+        }
+      }
+    },
+    {
+      "id": "s09_core",
+      "name": "09 – Core Builders: quantity + method + heat + blueprint (8b-fast)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{cf.url_8b}}",
+        "headers": {
+          "Authorization": "{{cf.token}}"
+        },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a precise recipe step generator. Create detailed, actionable cooking steps with exact quantities and temperatures. Output ONLY valid JSON — no markdown: {\"steps\":[\"1. ...\",\"2. ...\"],\"primary_method\":\"...\",\"heat_levels\":[\"medium\",\"high\"],\"key_techniques\":[\"...\"],\"timing_notes\":\"...\"}"
+            },
+            {
+              "role": "user",
+              "content": "{{json:s08_fusion.result.response}}"
+            }
+          ],
+          "max_tokens": 2048
+        },
+        "retry": {
+          "max": 1,
+          "delay_ms": 500,
+          "backoff": false
+        }
+      }
+    },
+    {
+      "id": "s10_sensory",
+      "name": "10 – Sensory & Presentation Agent (70b)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{cf.url_70b}}",
+        "headers": {
+          "Authorization": "{{cf.token}}"
+        },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a sensory experience and food styling specialist. Describe the dish's sensory qualities in vivid, professional detail. Output ONLY valid JSON — no markdown: {\"aroma\":\"...\",\"texture\":\"...\",\"taste_profile\":\"...\",\"color_appearance\":\"...\",\"plating_suggestion\":\"...\",\"garnish\":[\"...\"],\"serving_temperature\":\"...\"}"
+            },
+            {
+              "role": "user",
+              "content": "Recipe: {{json:s08_fusion.result.response}}\nCooking steps: {{json:s09_core.result.response}}"
+            }
+          ],
+          "max_tokens": 1024
+        },
+        "retry": {
+          "max": 2,
+          "delay_ms": 1000,
+          "backoff": true
+        }
+      }
+    },
+    {
+      "id": "s11_narrative",
+      "name": "11 – Narrative & Engagement Agent (70b)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{cf.url_70b}}",
+        "headers": {
+          "Authorization": "{{cf.token}}"
+        },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "Kamu adalah penulis kuliner yang hangat dan berempati. Tulis cerita latar budaya yang emosional untuk hidangan ini. Output HANYA JSON valid — tanpa markdown: {\"story\":\"cerita maks 200 kata, emosional, dalam Bahasa Indonesia\",\"origin\":\"...\",\"cultural_significance\":\"...\",\"best_occasion\":\"...\",\"fun_fact\":\"...\"}"
+            },
+            {
+              "role": "user",
+              "content": "{{json:s08_fusion.result.response}}"
+            }
+          ],
+          "max_tokens": 1024
+        },
+        "retry": {
+          "max": 2,
+          "delay_ms": 1000,
+          "backoff": true
+        }
+      }
+    },
+    {
+      "id": "s12_critics",
+      "name": "12 – Multi-Pass Critics: 7 dimensi (8b-fast)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{cf.url_8b}}",
+        "headers": {
+          "Authorization": "{{cf.token}}"
+        },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a strict culinary quality evaluator. Score the recipe across exactly 7 dimensions from 0.0 to 10.0. Compute average. Set quality_ok=false if average < 9.5. Output ONLY valid JSON — no markdown: {\"fact\":0.0,\"realism\":0.0,\"health\":0.0,\"culture\":0.0,\"sensory\":0.0,\"budget\":0.0,\"meta\":0.0,\"average\":0.0,\"feedback\":\"specific points to improve\",\"quality_ok\":true}"
+            },
+            {
+              "role": "user",
+              "content": "Base recipe: {{json:s08_fusion.result.response}}\nSteps: {{json:s09_core.result.response}}\nSensory: {{json:s10_sensory.result.response}}\nNarrative: {{json:s11_narrative.result.response}}"
+            }
+          ],
+          "max_tokens": 512
+        },
+        "retry": {
+          "max": 1,
+          "delay_ms": 500,
+          "backoff": false
+        }
+      }
+    },
+    {
+      "id": "s13_quality_gate",
+      "name": "13 – Quality Gate: score < 9.5 → retry",
+      "type": "branch",
+      "value": {
+        "cases": [
+          {
+            "when": {
+              "left": "{{s12_critics.result.response}}",
+              "op": "contains",
+              "right": "quality_ok\":false"
+            },
+            "goto": "s14_retry_enrich"
+          },
+          {
+            "goto": "s15_nutrition_vars"
+          }
+        ]
+      }
+    },
+    {
+      "id": "s14_retry_enrich",
+      "name": "14 – Retry: improve with critic feedback (70b)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{cf.url_70b}}",
+        "headers": {
+          "Authorization": "{{cf.token}}"
+        },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a culinary improvement specialist. Improve the recipe by addressing ALL points in the critic feedback. Output ONLY valid JSON with the same structure as the original recipe — no markdown: {\"title\":\"...\",\"description\":\"...\",\"ingredients\":[...],\"difficulty\":\"...\",\"equipment\":[...],\"prep_time_min\":0,\"cook_time_min\":0,\"serving_size\":\"...\",\"cuisine_type\":\"...\",\"meal_type\":\"...\",\"cultural_notes\":\"...\",\"health_notes\":\"...\",\"allergens\":[...],\"budget\":\"...\",\"estimated_cost_idr\":0}"
+            },
+            {
+              "role": "user",
+              "content": "Original recipe: {{json:s08_fusion.result.response}}\nCritic feedback: {{json:s12_critics.result.response}}"
+            }
+          ],
+          "max_tokens": 1024
+        },
+        "retry": {
+          "max": 2,
+          "delay_ms": 1500,
+          "backoff": true
+        }
+      },
+      "next": "s15_nutrition_vars"
+    },
+    {
+      "id": "s15_nutrition_vars",
+      "name": "15 – Nutrition, Plating & Variations (70b)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{cf.url_70b}}",
+        "headers": {
+          "Authorization": "{{cf.token}}"
+        },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a nutrition and recipe variation specialist. Compute per-serving nutrition and generate 4 creative variations. Output ONLY valid JSON — no markdown: {\"nutrition\":{\"calories\":0,\"protein_g\":0,\"fat_g\":0,\"carbs_g\":0,\"fiber_g\":0,\"sodium_mg\":0},\"variations\":[\"Versi vegan: ...\",\"Versi hemat: ...\",\"Versi ekstra pedas: ...\",\"Versi festive: ...\"],\"plating_tips\":[\"...\",\"...\"],\"storage_tips\":\"...\",\"shelf_life_hours\":0}"
+            },
+            {
+              "role": "user",
+              "content": "Improved recipe (if available, else empty): {{json:s14_retry_enrich.result.response}}\nOriginal recipe (fallback): {{json:s08_fusion.result.response}}\nUse whichever contains data."
+            }
+          ],
+          "max_tokens": 1024
+        },
+        "retry": {
+          "max": 2,
+          "delay_ms": 1000,
+          "backoff": true
+        }
+      }
+    },
+    {
+      "id": "s16_final_polish",
+      "name": "16 – Final Polish & JSON Assembly (70b)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{cf.url_70b}}",
+        "headers": {
+          "Authorization": "{{cf.token}}"
+        },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a final JSON assembler. Merge ALL provided inputs into one complete, clean recipe object. Generate a UUID v4 for recipe_id. Output ONLY valid JSON — absolutely no markdown, no preamble, no trailing text: {\"recipe_id\":\"uuid-v4-here\",\"title\":\"...\",\"description\":\"...\",\"ingredients\":[...],\"steps\":[...],\"difficulty\":\"...\",\"equipment\":[...],\"prep_time_min\":0,\"cook_time_min\":0,\"serving_size\":\"...\",\"cuisine_type\":\"...\",\"meal_type\":\"...\",\"nutrition\":{\"calories\":0,\"protein_g\":0,\"fat_g\":0,\"carbs_g\":0,\"fiber_g\":0},\"variations\":[...],\"sensory\":{\"aroma\":\"...\",\"texture\":\"...\",\"taste_profile\":\"...\",\"color_appearance\":\"...\",\"plating_suggestion\":\"...\"},\"story\":\"...\",\"cultural_notes\":\"...\",\"health_notes\":\"...\",\"budget\":\"...\",\"allergens\":[...],\"confidence\":0.0,\"critics\":{\"fact\":0.0,\"realism\":0.0,\"health\":0.0,\"culture\":0.0,\"sensory\":0.0,\"budget\":0.0,\"meta\":0.0,\"average\":0.0}}"
+            },
+            {
+              "role": "user",
+              "content": "Base recipe: {{json:s08_fusion.result.response}}\nCooking steps: {{json:s09_core.result.response}}\nSensory: {{json:s10_sensory.result.response}}\nNarrative: {{json:s11_narrative.result.response}}\nNutrition+Variations: {{json:s15_nutrition_vars.result.response}}\nCritics scores: {{json:s12_critics.result.response}}"
+            }
+          ],
+          "max_tokens": 4096
+        },
+        "retry": {
+          "max": 1,
+          "delay_ms": 500,
+          "backoff": false
+        }
+      }
+    },
+    {
+      "id": "s16c_check_complete",
+      "name": "16c – Validate: JSON complete? (has 'critics' key)",
+      "type": "branch",
+      "value": {
+        "cases": [
+          {
+            "when": {
+              "left": "{{s16_final_polish.result.response}}",
+              "op": "contains",
+              "right": "critics"
+            },
+            "goto": "s16b_save_file"
+          },
+          {
+            "when": {
+              "left": "{{s16_final_polish.result.response}}",
+              "op": "contains",
+              "right": "allergens"
+            },
+            "goto": "s16b_save_file"
+          },
+          {
+            "goto": "s16d_repair"
+          }
+        ]
+      }
+    },
+    {
+      "id": "s16d_repair",
+      "name": "16d – Repair: complete truncated JSON (70b)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{cf.url_70b}}",
+        "headers": {
+          "Authorization": "{{cf.token}}"
+        },
+        "body": {
+          "max_tokens": 4096,
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a JSON repair specialist. The user will give you a TRUNCATED JSON recipe object. Complete it properly and output ONLY the complete valid JSON — no markdown, no explanation. Include all required fields: recipe_id, title, description, ingredients, steps, difficulty, equipment, prep_time_min, cook_time_min, serving_size, cuisine_type, meal_type, nutrition, variations, sensory, story, cultural_notes, health_notes, budget, allergens, confidence, critics."
+            },
+            {
+              "role": "user",
+              "content": "Complete this truncated JSON: {{json:s16_final_polish.result.response}}"
+            }
+          ]
+        },
+        "retry": {
+          "max": 1,
+          "delay_ms": 1000,
+          "backoff": false
+        }
+      },
+      "next": "s16b_save_repair"
+    },
+    {
+      "id": "s16b_save_file",
+      "name": "16b – Save Result to File (output folder)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "http://localhost:8080/files/save",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "tag": "recipe",
+          "content": "{{json:s16_final_polish.result.response}}"
+        },
+        "retry": {
+          "max": 2,
+          "delay_ms": 500,
+          "backoff": false
+        }
+      }
+    },
+    {
+      "id": "s16b_save_repair",
+      "name": "16b-R – Save Repaired Result to File",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "http://localhost:8080/files/save",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "tag": "recipe",
+          "content": "{{json:s16d_repair.result.response}}"
+        },
+        "retry": {
+          "max": 2,
+          "delay_ms": 500,
+          "backoff": false
+        }
+      },
+      "next": "s17_log_result"
+    },
+    {
+      "id": "s17_log_result",
+      "name": "17 – Log Final Recipe",
+      "type": "log",
+      "value": {
+        "message": "RECIPE_DONE | input={{s01_webhook.input}} | critics_avg={{s12_critics.result.response}} | file={{s16b_save_file.result.response}}"
+      }
+    },
+    {
+      "id": "s18_run_complete",
+      "name": "18 – Run Complete (juga menangani unknown input)",
+      "type": "log",
+      "value": {
+        "message": "RUN_COMPLETE | worker=recipe-agent-v1 | input={{s01_webhook.input}} | detected_type={{s02_detect.result.response}} | saved_file={{s16b_save_file.result.response}}"
+      }
+    }
+  ]
+}

@@ -1,654 +1,662 @@
-# Worker Engine — curl Examples
+# curl-agent-recipe-generator.md
 
-Panduan lengkap penggunaan semua endpoint dan fitur Worker Engine via `curl`.
-
----
-
-## Daftar Isi
-
-1. [CRUD Dasar](#1-crud-dasar)
-2. [Run & Stop & Status](#2-run--stop--status)
-3. [Step Types — Contoh Minimal](#3-step-types--contoh-minimal)
-4. [Agentic AI: Resep Masakan](#4-agentic-ai-resep-masakan)
-5. [Workflow dengan Retry & Sleep](#5-workflow-dengan-retry--sleep)
-6. [Webhook Query Params & Headers](#6-webhook-query-params--headers)
-7. [Tips & Troubleshooting](#7-tips--troubleshooting)
+Kumpulan curl untuk membuat, menguji, dan mengelola **Recipe Generator Agent** —
+implementasi `rancangan_membuat_agent.md` di atas engine `main.go`.
 
 ---
 
-## 1. CRUD Dasar
+## 📐 Pemetaan Rancangan → main.go
 
-### Create Worker (minimal)
+| Fase Rancangan | Step Type main.go | Catatan |
+|---|---|---|
+| Input-Handling Layer | `webhook` + `call_api` (8b) + `branch` | Deteksi tipe input via LLM |
+| Enrichment Step 2-A/B/C/D | `call_api` (70b) + `call_api` (8b) | Sekuensial |
+| Validator Step 3 | `call_api` (8b) | JSON re-check |
+| Context Enricher Step 4 | `call_api` (70b) | |
+| Parallel Domain Agents Step 5-8 | `call_api` (70b) × 1 *(digabung)* | main.go tidak parallel → digabung 1 call |
+| First Fusion Step 9 | `call_api` (8b) | |
+| Core Builders Step 10-13 | `call_api` (8b) | |
+| Sensory & Presentation Step 14-15 | `call_api` (70b) | |
+| Narrative Step 16 | `call_api` (70b) | |
+| Critics Step 17-24 | `call_api` (8b) + `branch` | Quality gate |
+| Nutrition/Plating/Variations Step 25-27 | `call_api` (70b) | |
+| Final Polish Step 28 | `call_api` (8b) | |
 
-```bash
-curl -X POST http://localhost:8080/create \
-  -H "Content-Type: application/json" \
-  -d '{
-  "name": "Hello Worker",
-  "mode": "once",
-  "steps": [
-    { "type": "log", "value": { "message": "Hello, world!" } }
-  ]
-}'
+> **Catatan loop feedback:** rancangan max 3 iterasi → diimplementasikan sebagai 1× retry via `branch` (quality gate). Jump limit engine = 1000, cukup aman.
+
+---
+
+## ⚙️ Prerequisites
+
 ```
-
-### Create Worker + langsung jalankan
-
-```bash
-curl -X POST http://localhost:8080/create \
-  -H "Content-Type: application/json" \
-  -d '{
-  "name": "Ping Worker",
-  "mode": "loop",
-  "loop_interval_ms": 2000,
-  "running": true,
-  "steps": [
-    { "id": "ping", "type": "call_api", "value": { "method": "GET", "url": "https://api.ipify.org/?format=json" } },
-    { "type": "log", "value": { "message": "My IP: {{ping.ip}}" } }
-  ]
-}'
-```
-
-### List semua worker
-
-```bash
-curl http://localhost:8080/list
-```
-
-### Get satu worker
-
-```bash
-curl "http://localhost:8080/get?id=WORKER_ID"
-```
-
-### Update worker (full replace)
-
-```bash
-curl -X PUT http://localhost:8080/update \
-  -H "Content-Type: application/json" \
-  -d '{
-  "id": "WORKER_ID",
-  "name": "Ping Worker v2",
-  "mode": "loop",
-  "loop_interval_ms": 5000,
-  "running": true,
-  "steps": [
-    { "id": "ping", "type": "call_api", "value": { "method": "GET", "url": "https://api.ipify.org/?format=json" } },
-    { "type": "log", "value": { "message": "IP: {{ping.ip}} — updated!" } }
-  ]
-}'
-```
-
-> Jika steps berubah, worker otomatis di-restart. Jika hanya vars yang berubah, worker terus berjalan dan membaca vars baru di iterasi berikutnya.
-
-### Delete worker
-
-```bash
-curl -X DELETE "http://localhost:8080/delete?id=WORKER_ID"
+Server main.go berjalan di: http://localhost:8080
 ```
 
 ---
 
-## 2. Run & Stop & Status
+## 1. 🚀 CREATE WORKER
 
-### Start worker yang sedang berhenti
-
-```bash
-curl -X POST "http://localhost:8080/run?id=WORKER_ID"
-```
-
-### Stop worker yang sedang berjalan
+Buat agent, langsung `running: true` (mode `loop` — menunggu webhook tiap iterasi).
 
 ```bash
-curl -X POST "http://localhost:8080/stop?id=WORKER_ID"
-```
-
-### Status runtime (running, last error, run count)
-
-```bash
-curl "http://localhost:8080/status?id=WORKER_ID"
-```
-
-Response:
-```json
+# Simpan definisi worker ke file JSON terlebih dahulu
+cat > recipe-agent.json << 'ENDJSON'
 {
-  "id": "a3f2c1d4-...",
-  "running": true,
-  "last_run_at": "2026-03-26T10:00:00Z",
-  "last_run_ok": true,
-  "last_error": "",
-  "run_count": 42
-}
-```
-
-> `run_count` dan `last_error` reset saat server restart — data in-memory only.
-
----
-
-## 3. Step Types — Contoh Minimal
-
-### `webhook` — menunggu request masuk
-
-```bash
-# 1. Buat worker
-curl -X POST http://localhost:8080/create \
-  -H "Content-Type: application/json" \
-  -d '{
-  "name": "Webhook Demo",
-  "mode": "once",
-  "running": true,
-  "steps": [
-    { "id": "hook", "type": "webhook", "value": { "method": "POST", "path": "/data" } },
-    { "type": "log", "value": { "message": "Got: {{hook.message}}" } }
-  ]
-}'
-
-# 2. Trigger (ganti WORKER_ID)
-curl -X POST http://localhost:8080/WORKER_ID/data \
-  -H "Content-Type: application/json" \
-  -d '{"message": "hello from trigger"}'
-```
-
-### `branch` — routing kondisional
-
-```bash
-curl -X POST http://localhost:8080/create \
-  -H "Content-Type: application/json" \
-  -d '{
-  "name": "Branch Demo",
+  "id": "recipe-agent-v1",
+  "name": "Recipe Generator Agent",
   "mode": "loop",
-  "running": true,
-  "steps": [
-    { "id": "hook", "type": "webhook", "value": { "method": "POST", "path": "/check" } },
-    {
-      "id": "route",
-      "type": "branch",
-      "value": {
-        "cases": [
-          { "when": { "left": "{{hook.role}}", "op": "==", "right": "admin" }, "goto": "admin_log" },
-          { "when": { "left": "{{hook.score}}", "op": ">=", "right": "80" }, "goto": "pass_log" },
-          { "goto": "fail_log" }
-        ]
-      }
-    },
-    { "id": "admin_log", "type": "log", "value": { "message": "ADMIN: {{hook.name}}" }, "next": "end" },
-    { "id": "pass_log",  "type": "log", "value": { "message": "PASS: {{hook.name}} ({{hook.score}})" }, "next": "end" },
-    { "id": "fail_log",  "type": "log", "value": { "message": "FAIL: {{hook.name}}" }, "next": "end" },
-    { "id": "end", "type": "log", "value": { "message": "Done." } }
-  ]
-}'
-```
-
-Trigger:
-```bash
-curl -X POST http://localhost:8080/WORKER_ID/check \
-  -H "Content-Type: application/json" \
-  -d '{"role": "admin", "name": "Alice", "score": "95"}'
-
-curl -X POST http://localhost:8080/WORKER_ID/check \
-  -H "Content-Type: application/json" \
-  -d '{"role": "user", "name": "Bob", "score": "85"}'
-
-curl -X POST http://localhost:8080/WORKER_ID/check \
-  -H "Content-Type: application/json" \
-  -d '{"role": "user", "name": "Charlie", "score": "55"}'
-```
-
-### `sleep` — delay eksplisit
-
-```bash
-curl -X POST http://localhost:8080/create \
-  -H "Content-Type: application/json" \
-  -d '{
-  "name": "Sleep Demo",
-  "mode": "once",
-  "running": true,
-  "steps": [
-    { "type": "log", "value": { "message": "Mulai..." } },
-    { "type": "sleep", "value": { "sleep_seconds": 3 } },
-    { "type": "log", "value": { "message": "Selesai setelah 3 detik." } }
-  ]
-}'
-```
-
-### `set_var` — simpan nilai computed
-
-```bash
-curl -X POST http://localhost:8080/create \
-  -H "Content-Type: application/json" \
-  -d '{
-  "name": "Set Var Demo",
-  "mode": "once",
-  "running": true,
-  "steps": [
-    { "id": "hook", "type": "webhook", "value": { "method": "POST", "path": "/input" } },
-    {
-      "id": "prep",
-      "type": "set_var",
-      "value": { "set_key": "greeting", "set_value": "Halo, {{hook.name}}! Skor kamu: {{hook.score}}" }
-    },
-    { "type": "log", "value": { "message": "{{prep.greeting}}" } }
-  ]
-}'
-```
-
-Trigger:
-```bash
-curl -X POST http://localhost:8080/WORKER_ID/input \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Budi", "score": "95"}'
-```
-
-Log output: `Halo, Budi! Skor kamu: 95`
-
-### `call_api` dengan retry
-
-```bash
-curl -X POST http://localhost:8080/create \
-  -H "Content-Type: application/json" \
-  -d '{
-  "name": "Retry Demo",
-  "mode": "once",
-  "running": true,
-  "steps": [
-    {
-      "id": "fetch",
-      "type": "call_api",
-      "value": {
-        "method": "GET",
-        "url": "https://httpbin.org/status/503",
-        "retry": { "max": 3, "delay_ms": 500, "backoff": true }
-      }
-    },
-    { "type": "log", "value": { "message": "Status: {{fetch._status}} | Error: {{fetch._error}} | Attempts: {{fetch._attempts}}" } }
-  ]
-}'
-```
-
-Delay sequence dengan backoff: 500ms → 1000ms → 2000ms.
-
----
-
-## 4. Agentic AI: Resep Masakan
-
-Worker ini menerima input masakan dalam 3 bentuk (**deskripsi**, **judul**, **bahan**), routing ke agent AI yang sesuai, lalu AI validator memastikan output JSON lengkap 5 field.
-
-### Alur
-
-```
-webhook (input)
-    │
-    ▼
-branch (detect_type)
-    ├── type == "deskripsi"  ──► agent_deskripsi ──┐
-    ├── type == "judul"      ──► agent_judul      ──┤  output: agent_raw
-    ├── type == "bahan"      ──► agent_bahan      ──┘
-    └── else                 ──► log_undefined ──► end
-                                                    │
-                                                    ▼
-                                              parse_result (validator AI)
-                                                    │
-                                                    ▼
-                                              log_result → end
-```
-
-### CREATE WORKER
-
-```bash
-curl -X POST http://localhost:8080/create \
-  -H "Content-Type: application/json" \
-  -d '{
-  "name": "Agentic AI: Resep Masakan",
-  "mode": "loop",
+  "loop_interval_ms": 1000,
   "running": true,
   "vars": {
-    "glb": {
-      "ai_model": "@cf/meta/llama-3.1-8b-instruct-fast",
-      "api_url": "https://api.cloudflare.com/client/v4/accounts/{{pvt.cf_id}}/ai/run/{{glb.ai_model}}"
-    },
-    "pvt": {
-      "cf_id": "GANTI_CF_ACCOUNT_ID",
-      "cf_auth": "GANTI_CF_API_TOKEN"
+    "cf": {
+      "token":   "Bearer cfut_KpdkVf3ZkIArmKDoBLQySa2TA4Pb5MXY4ZkXA7Qbe21abbbf",
+      "url_8b":  "https://api.cloudflare.com/client/v4/accounts/56667d302adadb8e04093b1aac32017c/ai/run/@cf/meta/llama-3.1-8b-instruct-fast",
+      "url_70b": "https://api.cloudflare.com/client/v4/accounts/56667d302adadb8e04093b1aac32017c/ai/run/@cf/meta/llama-3.1-70b-instruct"
     }
   },
   "steps": [
+
     {
-      "id": "input",
-      "name": "Terima Input Pengguna",
+      "id":   "s01_webhook",
+      "name": "01 – Receive Input",
       "type": "webhook",
-      "value": { "method": "POST", "path": "/masakan" }
+      "value": { "method": "POST", "path": "/recipe" }
     },
+
     {
-      "id": "detect_type",
-      "name": "Deteksi Tipe Input",
-      "type": "branch",
-      "value": {
-        "cases": [
-          { "when": { "left": "{{input.type}}", "op": "==", "right": "deskripsi" }, "goto": "agent_deskripsi" },
-          { "when": { "left": "{{input.type}}", "op": "==", "right": "judul"     }, "goto": "agent_judul"     },
-          { "when": { "left": "{{input.type}}", "op": "==", "right": "bahan"     }, "goto": "agent_bahan"     },
-          { "goto": "log_undefined" }
-        ]
-      }
-    },
-    {
-      "id": "agent_deskripsi",
-      "name": "Agent AI — dari Deskripsi",
+      "id":   "s02_detect",
+      "name": "02 – Input Classification (8b-fast)",
       "type": "call_api",
       "value": {
         "method": "POST",
-        "url": "{{glb.api_url}}",
-        "headers": { "Authorization": "Bearer {{pvt.cf_auth}}" },
+        "url":     "{{cf.url_8b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
         "body": {
           "messages": [
             {
               "role": "system",
-              "content": "Kamu adalah chef AI. Pengguna memberi DESKRIPSI masakan. Buat resep lengkap. WAJIB jawab HANYA JSON valid tanpa teks tambahan. Format: {\"judul\":\"...\",\"deskripsi\":\"...\",\"bahan\":\"...\",\"cara_masak\":\"...\",\"saran_penyajian\":\"...\"}"
-            },
-            { "role": "user", "content": "Buat resep dari deskripsi: {{json:input.data}}" }
-          ]
-        },
-        "retry": { "max": 2, "delay_ms": 1000 }
-      },
-      "output": { "agent_raw": "{{agent_deskripsi.result.response}}" },
-      "next": "parse_result"
-    },
-    {
-      "id": "agent_judul",
-      "name": "Agent AI — dari Judul",
-      "type": "call_api",
-      "value": {
-        "method": "POST",
-        "url": "{{glb.api_url}}",
-        "headers": { "Authorization": "Bearer {{pvt.cf_auth}}" },
-        "body": {
-          "messages": [
-            {
-              "role": "system",
-              "content": "Kamu adalah chef AI. Pengguna memberi NAMA masakan. Buat resep lengkap. WAJIB jawab HANYA JSON valid tanpa teks tambahan. Format: {\"judul\":\"...\",\"deskripsi\":\"...\",\"bahan\":\"...\",\"cara_masak\":\"...\",\"saran_penyajian\":\"...\"}"
-            },
-            { "role": "user", "content": "Buat resep untuk masakan: {{json:input.data}}" }
-          ]
-        },
-        "retry": { "max": 2, "delay_ms": 1000 }
-      },
-      "output": { "agent_raw": "{{agent_judul.result.response}}" },
-      "next": "parse_result"
-    },
-    {
-      "id": "agent_bahan",
-      "name": "Agent AI — dari Bahan",
-      "type": "call_api",
-      "value": {
-        "method": "POST",
-        "url": "{{glb.api_url}}",
-        "headers": { "Authorization": "Bearer {{pvt.cf_auth}}" },
-        "body": {
-          "messages": [
-            {
-              "role": "system",
-              "content": "Kamu adalah chef AI. Pengguna memberi daftar BAHAN. Rekomendasikan dan buat resep terbaik. WAJIB jawab HANYA JSON valid tanpa teks tambahan. Format: {\"judul\":\"...\",\"deskripsi\":\"...\",\"bahan\":\"...\",\"cara_masak\":\"...\",\"saran_penyajian\":\"...\"}"
-            },
-            { "role": "user", "content": "Bahan yang saya punya: {{json:input.data}}. Buat resep dari bahan ini." }
-          ]
-        },
-        "retry": { "max": 2, "delay_ms": 1000 }
-      },
-      "output": { "agent_raw": "{{agent_bahan.result.response}}" },
-      "next": "parse_result"
-    },
-    {
-      "id": "log_undefined",
-      "name": "Tipe Tidak Dikenal",
-      "type": "log",
-      "value": {
-        "message": "[UNDEFINED] Tipe: \"{{input.type}}\" | data: \"{{input.data}}\" | Gunakan: deskripsi / judul / bahan"
-      },
-      "next": "end"
-    },
-    {
-      "id": "parse_result",
-      "name": "Agent AI — Validator JSON",
-      "type": "call_api",
-      "value": {
-        "method": "POST",
-        "url": "{{glb.api_url}}",
-        "headers": { "Authorization": "Bearer {{pvt.cf_auth}}" },
-        "body": {
-          "messages": [
-            {
-              "role": "system",
-              "content": "Kamu adalah JSON validator. Input adalah teks yang seharusnya berisi JSON resep. Pastikan output JSON valid dengan tepat 5 field: judul, deskripsi, bahan, cara_masak, saran_penyajian. Jika field hilang tambahkan. Buang semua teks di luar JSON. WAJIB jawab HANYA JSON murni TANPA markdown TANPA backtick."
+              "content": "You are a culinary input classifier. Analyze the user input and respond ONLY with a compact JSON object — no markdown, no extra text: {\"type\":\"title|ingredients|description|combination|unknown\"}. Rules: title=single dish name only. ingredients=comma or newline separated ingredient list. description=narrative paragraph longer than 30 words. combination=two or more of the above. unknown=non-food gibberish that cannot be interpreted as any recipe element."
             },
             {
               "role": "user",
-              "content": "Validasi JSON ini: {{agent_deskripsi.agent_raw}}{{agent_judul.agent_raw}}{{agent_bahan.agent_raw}}"
+              "content": "{{json:s01_webhook.input}}"
             }
           ]
         },
-        "retry": { "max": 2, "delay_ms": 1000 }
-      },
-      "output": { "final": "{{parse_result.result.response}}" },
-      "next": "log_result"
-    },
-    {
-      "id": "log_result",
-      "name": "Output Akhir",
-      "type": "log",
-      "value": {
-        "message": "[RESEP] type={{input.type}} | input={{input.data}} | result={{parse_result.final}}"
-      },
-      "next": "end"
-    },
-    {
-      "id": "end",
-      "name": "Selesai",
-      "type": "log",
-      "value": { "message": "[END] Menunggu input berikutnya..." }
-    }
-  ]
-}'
-```
-
-> Catat `"id"` dari response JSON → pakai sebagai `WORKER_ID` di bawah.
-
-### TRIGGER WEBHOOK
-
-#### Test 1 — Input `deskripsi`
-
-```bash
-curl -X POST http://localhost:8080/WORKER_ID/masakan \
-  -H "Content-Type: application/json" \
-  -d '{
-  "type": "deskripsi",
-  "data": "Masakan pedas manis dengan protein tinggi, cocok untuk sarapan, menggunakan telur dan cabai"
-}'
-```
-
-#### Test 2 — Input `judul`
-
-```bash
-curl -X POST http://localhost:8080/WORKER_ID/masakan \
-  -H "Content-Type: application/json" \
-  -d '{
-  "type": "judul",
-  "data": "Rendang Daging Sapi"
-}'
-```
-
-#### Test 3 — Input `bahan`
-
-```bash
-curl -X POST http://localhost:8080/WORKER_ID/masakan \
-  -H "Content-Type: application/json" \
-  -d '{
-  "type": "bahan",
-  "data": "ayam kampung, santan, serai, daun salam, lengkuas, bawang merah, bawang putih, kemiri, kunyit"
-}'
-```
-
-#### Test 4 — Tipe undefined (edge case)
-
-```bash
-curl -X POST http://localhost:8080/WORKER_ID/masakan \
-  -H "Content-Type: application/json" \
-  -d '{
-  "type": "foto",
-  "data": "gambar nasi goreng"
-}'
-```
-
-Expected log:
-```
-[UNDEFINED] Tipe: "foto" | data: "gambar nasi goreng" | Gunakan: deskripsi / judul / bahan
-```
-
-### Expected Log (sukses — judul)
-
-```
-[worker:ID][step:Deteksi Tipe Input] BRANCH case[1] match ("judul" == "judul") → goto "agent_judul"
-[worker:ID][step:Agent AI — dari Judul] CALL_API POST https://api.cloudflare.com/... → HTTP 200 | {"result":{"response":"{\"judul\":\"Rendang..."}...}
-[worker:ID][step:Agent AI — Validator JSON] CALL_API POST ... → HTTP 200 | ...
-[worker:ID][step:Output Akhir] LOG → [RESEP] type=judul | input=Rendang Daging Sapi | result={"judul":"Rendang Daging Sapi",...}
-[worker:ID][step:Selesai] LOG → [END] Menunggu input berikutnya...
-```
-
-### Catatan: `{{json:input.data}}` vs `{{input.data}}`
-
-Gunakan `{{json:input.data}}` saat menginject nilai user ke dalam string JSON body. Jika `input.data` berisi tanda kutip atau karakter spesial (misalnya `He said "yes"`), tanpa `json:` akan menghasilkan JSON malformed dan call_api gagal dengan HTTP 400.
-
----
-
-## 5. Workflow dengan Retry & Sleep
-
-Worker polling API setiap 10 detik dengan retry otomatis:
-
-```bash
-curl -X POST http://localhost:8080/create \
-  -H "Content-Type: application/json" \
-  -d '{
-  "name": "Polling Worker",
-  "mode": "loop",
-  "loop_interval_ms": 10000,
-  "running": true,
-  "vars": {
-    "cfg": { "api_url": "https://httpbin.org/get" }
-  },
-  "steps": [
-    {
-      "id": "fetch",
-      "type": "call_api",
-      "value": {
-        "method": "GET",
-        "url": "{{cfg.api_url}}",
-        "retry": { "max": 3, "delay_ms": 2000, "backoff": true }
+        "retry": { "max": 1, "delay_ms": 500, "backoff": false }
       }
     },
-    { "type": "log", "value": { "message": "Status: {{fetch._status}} | Origin: {{fetch.origin}}" } },
-    { "type": "sleep", "value": { "sleep_ms": 500 } },
-    { "type": "log", "value": { "message": "Loop selesai, menunggu 10 detik..." } }
+
+    {
+      "id":   "s03_branch_type",
+      "name": "03 – Route: unknown → skip pipeline",
+      "type": "branch",
+      "value": {
+        "cases": [
+          {
+            "when": {
+              "left":  "{{s02_detect.result.response}}",
+              "op":    "contains",
+              "right": "unknown"
+            },
+            "goto": "s18_run_complete"
+          }
+        ]
+      }
+    },
+
+    {
+      "id":   "s04_enrich",
+      "name": "04 – Enrichment: fill missing fields (70b)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a culinary expert specializing in Indonesian and Asian cuisine. From partial food input, infer ALL missing parts and output ONLY valid JSON — no markdown, no explanation: {\"title\":\"dish name\",\"description\":\"2–3 sentence description in Indonesian\",\"ingredients\":[\"ingredient with quantity\",\"...\"]}"
+            },
+            {
+              "role": "user",
+              "content": "Detected input type: {{json:s02_detect.result.response}}\nRaw input: {{json:s01_webhook.input}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s05_validate",
+      "name": "05 – Validator: check & consolidate JSON (8b-fast)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url":     "{{cf.url_8b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a strict JSON validator. Verify the input JSON contains all required keys: title (non-empty string), description (non-empty string), ingredients (non-empty array of strings). If valid, output the EXACT same JSON unchanged. If any key is missing or empty, add it with a sensible culinary default. Output ONLY valid JSON — no markdown."
+            },
+            {
+              "role": "user",
+              "content": "{{json:s04_enrich.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 1, "delay_ms": 500, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s06_context",
+      "name": "06 – Context Enricher: intent, difficulty, equipment (70b)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a culinary context analyzer. Enrich the recipe base data with cooking context. Output ONLY valid JSON — no markdown: {\"title\":\"...\",\"description\":\"...\",\"ingredients\":[...],\"difficulty\":\"easy|medium|hard\",\"equipment\":[\"...\"],\"serving_size\":\"N porsi\",\"prep_time_min\":0,\"cook_time_min\":0,\"cuisine_type\":\"...\",\"meal_type\":\"breakfast|lunch|dinner|snack|dessert\"}"
+            },
+            {
+              "role": "user",
+              "content": "{{json:s05_validate.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s07_domain",
+      "name": "07 – Domain Agents: ingredient + cultural + health + budget (70b)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a multi-domain culinary analyst covering 4 specializations simultaneously: (1) Ingredient Realism — are all ingredients real and available in Indonesia? (2) Cultural Authenticity — cultural context and notes. (3) Health Analysis — health benefits and cautions. (4) Budget Estimation — cost tier. Output ONLY valid JSON — no markdown: {\"ingredient_check\":{\"all_realistic\":true,\"substitutions\":{}},\"cultural_notes\":\"...\",\"health_notes\":\"...\",\"allergens\":[\"...\"],\"budget\":\"low|medium|high\",\"estimated_cost_idr\":0}"
+            },
+            {
+              "role": "user",
+              "content": "{{json:s06_context.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s08_fusion",
+      "name": "08 – First Fusion + Hallucination Guard (8b-fast)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url":     "{{cf.url_8b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a data fusion agent. Merge two JSON inputs (context enricher + domain analysis) into one coherent, hallucination-free recipe object. Remove any ingredient or step that does not make culinary sense. Output ONLY valid JSON — no markdown: {\"title\":\"...\",\"description\":\"...\",\"ingredients\":[...],\"difficulty\":\"...\",\"equipment\":[...],\"prep_time_min\":0,\"cook_time_min\":0,\"serving_size\":\"...\",\"cuisine_type\":\"...\",\"meal_type\":\"...\",\"cultural_notes\":\"...\",\"health_notes\":\"...\",\"allergens\":[...],\"budget\":\"...\",\"estimated_cost_idr\":0}"
+            },
+            {
+              "role": "user",
+              "content": "Context JSON: {{json:s06_context.result.response}}\nDomain JSON: {{json:s07_domain.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 1, "delay_ms": 500, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s09_core",
+      "name": "09 – Core Builders: quantity + method + heat + blueprint (8b-fast)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url":     "{{cf.url_8b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a precise recipe step generator. Create detailed, actionable cooking steps with exact quantities and temperatures. Output ONLY valid JSON — no markdown: {\"steps\":[\"1. ...\",\"2. ...\"],\"primary_method\":\"...\",\"heat_levels\":[\"medium\",\"high\"],\"key_techniques\":[\"...\"],\"timing_notes\":\"...\"}"
+            },
+            {
+              "role": "user",
+              "content": "{{json:s08_fusion.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 1, "delay_ms": 500, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s10_sensory",
+      "name": "10 – Sensory & Presentation Agent (70b)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a sensory experience and food styling specialist. Describe the dish's sensory qualities in vivid, professional detail. Output ONLY valid JSON — no markdown: {\"aroma\":\"...\",\"texture\":\"...\",\"taste_profile\":\"...\",\"color_appearance\":\"...\",\"plating_suggestion\":\"...\",\"garnish\":[\"...\"],\"serving_temperature\":\"...\"}"
+            },
+            {
+              "role": "user",
+              "content": "Recipe: {{json:s08_fusion.result.response}}\nCooking steps: {{json:s09_core.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s11_narrative",
+      "name": "11 – Narrative & Engagement Agent (70b)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "Kamu adalah penulis kuliner yang hangat dan berempati. Tulis cerita latar budaya yang emosional untuk hidangan ini. Output HANYA JSON valid — tanpa markdown: {\"story\":\"cerita maks 200 kata, emosional, dalam Bahasa Indonesia\",\"origin\":\"...\",\"cultural_significance\":\"...\",\"best_occasion\":\"...\",\"fun_fact\":\"...\"}"
+            },
+            {
+              "role": "user",
+              "content": "{{json:s08_fusion.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s12_critics",
+      "name": "12 – Multi-Pass Critics: 7 dimensi (8b-fast)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url":     "{{cf.url_8b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a strict culinary quality evaluator. Score the recipe across exactly 7 dimensions from 0.0 to 10.0. Compute average. Set quality_ok=false if average < 9.5. Output ONLY valid JSON — no markdown: {\"fact\":0.0,\"realism\":0.0,\"health\":0.0,\"culture\":0.0,\"sensory\":0.0,\"budget\":0.0,\"meta\":0.0,\"average\":0.0,\"feedback\":\"specific points to improve\",\"quality_ok\":true}"
+            },
+            {
+              "role": "user",
+              "content": "Base recipe: {{json:s08_fusion.result.response}}\nSteps: {{json:s09_core.result.response}}\nSensory: {{json:s10_sensory.result.response}}\nNarrative: {{json:s11_narrative.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 1, "delay_ms": 500, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s13_quality_gate",
+      "name": "13 – Quality Gate: score < 9.5 → retry",
+      "type": "branch",
+      "value": {
+        "cases": [
+          {
+            "when": {
+              "left":  "{{s12_critics.result.response}}",
+              "op":    "contains",
+              "right": "quality_ok\":false"
+            },
+            "goto": "s14_retry_enrich"
+          },
+          {
+            "goto": "s15_nutrition_vars"
+          }
+        ]
+      }
+    },
+
+    {
+      "id":   "s14_retry_enrich",
+      "name": "14 – Retry: improve with critic feedback (70b)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a culinary improvement specialist. Improve the recipe by addressing ALL points in the critic feedback. Output ONLY valid JSON with the same structure as the original recipe — no markdown: {\"title\":\"...\",\"description\":\"...\",\"ingredients\":[...],\"difficulty\":\"...\",\"equipment\":[...],\"prep_time_min\":0,\"cook_time_min\":0,\"serving_size\":\"...\",\"cuisine_type\":\"...\",\"meal_type\":\"...\",\"cultural_notes\":\"...\",\"health_notes\":\"...\",\"allergens\":[...],\"budget\":\"...\",\"estimated_cost_idr\":0}"
+            },
+            {
+              "role": "user",
+              "content": "Original recipe: {{json:s08_fusion.result.response}}\nCritic feedback: {{json:s12_critics.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1500, "backoff": true }
+      },
+      "next": "s15_nutrition_vars"
+    },
+
+    {
+      "id":   "s15_nutrition_vars",
+      "name": "15 – Nutrition, Plating & Variations (70b)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a nutrition and recipe variation specialist. Compute per-serving nutrition and generate 4 creative variations. Output ONLY valid JSON — no markdown: {\"nutrition\":{\"calories\":0,\"protein_g\":0,\"fat_g\":0,\"carbs_g\":0,\"fiber_g\":0,\"sodium_mg\":0},\"variations\":[\"Versi vegan: ...\",\"Versi hemat: ...\",\"Versi ekstra pedas: ...\",\"Versi festive: ...\"],\"plating_tips\":[\"...\",\"...\"],\"storage_tips\":\"...\",\"shelf_life_hours\":0}"
+            },
+            {
+              "role": "user",
+              "content": "Improved recipe (if available, else empty): {{json:s14_retry_enrich.result.response}}\nOriginal recipe (fallback): {{json:s08_fusion.result.response}}\nUse whichever contains data."
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s16_final_polish",
+      "name": "16 – Final Polish & JSON Assembly (8b-fast)",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url":     "{{cf.url_8b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "You are a final JSON assembler. Merge ALL provided inputs into one complete, clean recipe object. Generate a UUID v4 for recipe_id. Output ONLY valid JSON — absolutely no markdown, no preamble, no trailing text: {\"recipe_id\":\"uuid-v4-here\",\"title\":\"...\",\"description\":\"...\",\"ingredients\":[...],\"steps\":[...],\"difficulty\":\"...\",\"equipment\":[...],\"prep_time_min\":0,\"cook_time_min\":0,\"serving_size\":\"...\",\"cuisine_type\":\"...\",\"meal_type\":\"...\",\"nutrition\":{\"calories\":0,\"protein_g\":0,\"fat_g\":0,\"carbs_g\":0,\"fiber_g\":0},\"variations\":[...],\"sensory\":{\"aroma\":\"...\",\"texture\":\"...\",\"taste_profile\":\"...\",\"color_appearance\":\"...\",\"plating_suggestion\":\"...\"},\"story\":\"...\",\"cultural_notes\":\"...\",\"health_notes\":\"...\",\"budget\":\"...\",\"allergens\":[...],\"confidence\":0.0,\"critics\":{\"fact\":0.0,\"realism\":0.0,\"health\":0.0,\"culture\":0.0,\"sensory\":0.0,\"budget\":0.0,\"meta\":0.0,\"average\":0.0}}"
+            },
+            {
+              "role": "user",
+              "content": "Base recipe: {{json:s08_fusion.result.response}}\nCooking steps: {{json:s09_core.result.response}}\nSensory: {{json:s10_sensory.result.response}}\nNarrative: {{json:s11_narrative.result.response}}\nNutrition+Variations: {{json:s15_nutrition_vars.result.response}}\nCritics scores: {{json:s12_critics.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 1, "delay_ms": 500, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s17_log_result",
+      "name": "17 – Log Final Recipe",
+      "type": "log",
+      "value": {
+        "message": "RECIPE_DONE | input={{s01_webhook.input}} | critics_avg={{s12_critics.result.response}} | final_json={{s16_final_polish.result.response}}"
+      }
+    },
+
+    {
+      "id":   "s18_run_complete",
+      "name": "18 – Run Complete (juga menangani unknown input)",
+      "type": "log",
+      "value": {
+        "message": "RUN_COMPLETE | worker=recipe-agent-v1 | input={{s01_webhook.input}} | detected_type={{s02_detect.result.response}}"
+      }
+    }
+
   ]
-}'
-```
+}
+ENDJSON
 
----
-
-## 6. Webhook Query Params & Headers
-
-Worker yang membaca query param dan custom header:
-
-```bash
-curl -X POST http://localhost:8080/create \
+# Kirim ke worker engine
+curl -s -X POST http://localhost:8080/create \
   -H "Content-Type: application/json" \
-  -d '{
-  "name": "Query Header Demo",
-  "mode": "loop",
-  "running": true,
-  "steps": [
-    { "id": "hook", "type": "webhook", "value": { "method": "POST", "path": "/api" } },
-    { "type": "log", "value": {
-        "message": "body.action={{hook.action}} | query.version={{hook._query.version}} | header.X-Client={{hook._headers.X-Client}}"
-    }}
-  ]
-}'
+  -d @recipe-agent.json | jq .
 ```
 
-Trigger dengan query param dan custom header:
-
-```bash
-curl -X POST "http://localhost:8080/WORKER_ID/api?version=2&lang=id" \
-  -H "Content-Type: application/json" \
-  -H "X-Client: myapp-v2" \
-  -d '{"action": "search", "keyword": "rendang"}'
-```
-
-Expected log:
-```
-body.action=search | query.version=2 | header.X-Client=myapp-v2
-```
-
----
-
-## 7. Tips & Troubleshooting
-
-### HTTP 429 saat trigger webhook
-
-Worker masih memproses request sebelumnya. Tunggu sebentar lalu coba lagi. Untuk mode `loop`, ini normal jika workflow panjang dan request datang terlalu cepat.
-
-```bash
-# Cek apakah worker masih running
-curl "http://localhost:8080/status?id=WORKER_ID"
-```
-
-### Worker berhenti mendadak
-
-Cek `/status` untuk melihat last error:
-
-```bash
-curl "http://localhost:8080/status?id=WORKER_ID"
-# last_run_ok: false → ada error
-# last_error: "PANIC: ..." atau pesan error lain
-```
-
-Worker yang panic otomatis berhenti (`running: false`) dan error tersimpan. Perbaiki konfigurasi lalu jalankan lagi dengan `/run`.
-
-### HTTP 503 saat create/run
-
-Limit sistem tercapai:
-- `max concurrent workers reached` → stop worker yang tidak diperlukan dulu
-- `max stored workers reached` → hapus worker lama
-
-### JSON body di call_api rusak / HTTP 400
-
-Kemungkinan nilai template mengandung karakter spesial. Gunakan `{{json:step.field}}`:
-
+**Expected response:**
 ```json
-"body": { "message": "{{json:hook.user_text}}" }
-```
-
-### Update vars tanpa restart worker
-
-```bash
-curl -X PUT http://localhost:8080/update \
-  -H "Content-Type: application/json" \
-  -d '{
-  "id": "WORKER_ID",
-  "name": "Worker Name",
+{
+  "id": "recipe-agent-v1",
+  "name": "Recipe Generator Agent",
   "mode": "loop",
   "running": true,
-  "vars": {
-    "pvt": { "token": "NEW_TOKEN_HERE" }
-  },
-  "steps": [ ... ]
-}'
+  ...
+}
 ```
 
-Vars baru efektif di iterasi loop berikutnya tanpa restart goroutine.
+---
 
-### Cek semua worker sekaligus
+## 2. 🧪 WEBHOOK TEST — Input Judul Saja
+
+Setelah worker running, kirim request ke `/recipe-agent-v1/recipe`  
+(format path: `/{worker-id}{webhook-path}`).
 
 ```bash
-curl http://localhost:8080/list | python3 -m json.tool
-# atau jq jika tersedia:
-curl http://localhost:8080/list | jq '.[] | {id, name, running, mode}'
+curl -s -X POST http://localhost:8080/recipe-agent-v1/recipe \
+  -H "Content-Type: application/json" \
+  -d '{"input": "Sate Padang"}' | jq .
 ```
+
+**Expected response (HTTP 200):**
+```json
+{ "status": "received" }
+```
+
+---
+
+## 3. 🧪 WEBHOOK TEST — Input Kombinasi (judul + bahan)
+
+```bash
+curl -s -X POST http://localhost:8080/recipe-agent-v1/recipe \
+  -H "Content-Type: application/json" \
+  -d '{"input": "Rendang – daging sapi 500g, santan kental, lengkuas, serai, cabai merah, bawang merah, bawang putih, kunyit"}' | jq .
+```
+
+---
+
+## 4. 🧪 WEBHOOK TEST — Input Deskripsi Narasi
+
+```bash
+curl -s -X POST http://localhost:8080/recipe-agent-v1/recipe \
+  -H "Content-Type: application/json" \
+  -d '{"input": "Hidangan berkuah kuning khas Jawa Timur yang terbuat dari daging sapi empuk dengan bumbu rempah yang kaya. Biasanya disajikan saat lebaran dengan lontong atau ketupat."}' | jq .
+```
+
+---
+
+## 5. 🧪 WEBHOOK TEST — Input Tidak Dikenal (harus skip pipeline)
+
+Harus langsung loncat ke `s18_run_complete` tanpa memanggil LLM pipeline.
+
+```bash
+curl -s -X POST http://localhost:8080/recipe-agent-v1/recipe \
+  -H "Content-Type: application/json" \
+  -d '{"input": "asdf123xyz!!"}' | jq .
+```
+
+---
+
+## 6. 🧪 WEBHOOK TEST — Input Bahan Saja
+
+```bash
+curl -s -X POST http://localhost:8080/recipe-agent-v1/recipe \
+  -H "Content-Type: application/json" \
+  -d '{"input": "nasi putih, telur, kecap manis, bawang merah, bawang putih, cabai, minyak goreng"}' | jq .
+```
+
+---
+
+## 7. 📊 CEK STATUS WORKER
+
+```bash
+curl -s "http://localhost:8080/status?id=recipe-agent-v1" | jq .
+```
+
+**Expected response:**
+```json
+{
+  "id": "recipe-agent-v1",
+  "running": true,
+  "last_run_at": "2025-...",
+  "last_run_ok": true,
+  "last_error": "",
+  "run_count": 3
+}
+```
+
+---
+
+## 8. 📋 GET DEFINISI WORKER
+
+```bash
+curl -s "http://localhost:8080/get?id=recipe-agent-v1" | jq .
+```
+
+---
+
+## 9. 📋 LIST SEMUA WORKERS
+
+```bash
+curl -s http://localhost:8080/list | jq '[.[] | {id, name, mode, running}]'
+```
+
+---
+
+## 10. ⏹️ STOP WORKER
+
+```bash
+curl -s -X POST "http://localhost:8080/stop?id=recipe-agent-v1" | jq .
+```
+
+**Expected:**
+```json
+{ "status": "stopped" }
+```
+
+---
+
+## 11. ▶️ RESUME WORKER (tanpa update definisi)
+
+```bash
+curl -s -X POST "http://localhost:8080/run?id=recipe-agent-v1" | jq .
+```
+
+**Expected:**
+```json
+{ "status": "started", "mode": "loop" }
+```
+
+---
+
+## 12. ✏️ UPDATE VARS (ganti token tanpa restart steps)
+
+Update vars saja — engine otomatis me-refresh vars tiap iterasi loop.
+
+```bash
+curl -s -X PUT http://localhost:8080/update \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "recipe-agent-v1",
+    "name": "Recipe Generator Agent",
+    "mode": "loop",
+    "loop_interval_ms": 1000,
+    "running": true,
+    "vars": {
+      "cf": {
+        "token":   "Bearer NEW_TOKEN_HERE",
+        "url_8b":  "https://api.cloudflare.com/client/v4/accounts/56667d302adadb8e04093b1aac32017c/ai/run/@cf/meta/llama-3.1-8b-instruct-fast",
+        "url_70b": "https://api.cloudflare.com/client/v4/accounts/56667d302adadb8e04093b1aac32017c/ai/run/@cf/meta/llama-3.1-70b-instruct"
+      }
+    }
+  }' | jq '{id, name, running}'
+```
+
+---
+
+## 13. 🗑️ DELETE WORKER
+
+```bash
+curl -s -X DELETE "http://localhost:8080/delete?id=recipe-agent-v1" | jq .
+```
+
+**Expected:**
+```json
+{ "deleted": "recipe-agent-v1" }
+```
+
+---
+
+## 🔍 Trace Alur Pipeline (untuk debug via log)
+
+Setelah mengirim webhook, pantau log server. Urutan yang benar:
+
+```
+[worker:recipe-agent-v1][step:01 – Receive Input(s01_webhook)]         WEBHOOK triggered
+[worker:recipe-agent-v1][step:02 – Input Classification(s02_detect)]   CALL_API POST ...8b... → HTTP 200
+[worker:recipe-agent-v1][step:03 – Route(s03_branch_type)]             BRANCH → no case matched (valid input) ATAU BRANCH → goto s18_run_complete (unknown)
+[worker:recipe-agent-v1][step:04 – Enrichment(s04_enrich)]             CALL_API POST ...70b... → HTTP 200
+[worker:recipe-agent-v1][step:05 – Validator(s05_validate)]            CALL_API POST ...8b... → HTTP 200
+[worker:recipe-agent-v1][step:06 – Context Enricher(s06_context)]      CALL_API POST ...70b... → HTTP 200
+[worker:recipe-agent-v1][step:07 – Domain Agents(s07_domain)]          CALL_API POST ...70b... → HTTP 200
+[worker:recipe-agent-v1][step:08 – Fusion(s08_fusion)]                 CALL_API POST ...8b... → HTTP 200
+[worker:recipe-agent-v1][step:09 – Core Builders(s09_core)]            CALL_API POST ...8b... → HTTP 200
+[worker:recipe-agent-v1][step:10 – Sensory(s10_sensory)]               CALL_API POST ...70b... → HTTP 200
+[worker:recipe-agent-v1][step:11 – Narrative(s11_narrative)]           CALL_API POST ...70b... → HTTP 200
+[worker:recipe-agent-v1][step:12 – Critics(s12_critics)]               CALL_API POST ...8b... → HTTP 200
+[worker:recipe-agent-v1][step:13 – Quality Gate(s13_quality_gate)]     BRANCH → goto s14 (retry) ATAU goto s15 (ok)
+[worker:recipe-agent-v1][step:15 – Nutrition+Vars(s15_nutrition_vars)] CALL_API POST ...70b... → HTTP 200
+[worker:recipe-agent-v1][step:16 – Final Polish(s16_final_polish)]     CALL_API POST ...8b... → HTTP 200
+[worker:recipe-agent-v1][step:17 – Log Final(s17_log_result)]          LOG → RECIPE_DONE | ...
+[worker:recipe-agent-v1][step:18 – Run Complete(s18_run_complete)]     LOG → RUN_COMPLETE | ...
+[worker:recipe-agent-v1] workflow completed
+```
+
+---
+
+## 📊 Ringkasan Model per Step
+
+| Step | Model | Alasan |
+|------|-------|--------|
+| s02_detect | 8b-fast | Parsing ringan, konteks 128k |
+| s04_enrich | 70b | Pengetahuan kuliner luas |
+| s05_validate | 8b-fast | Struktur check, tidak perlu kreativitas |
+| s06_context | 70b | Inferensi konteks kompleks |
+| s07_domain | 70b | 4 domain analisis sekaligus |
+| s08_fusion | 8b-fast | Merge JSON, cukup struktural |
+| s09_core | 8b-fast | Step generation terstruktur |
+| s10_sensory | 70b | Kreativitas tinggi (temp 0.7) |
+| s11_narrative | 70b | Kreativitas maksimal (temp 0.85) |
+| s12_critics | 8b-fast | Evaluasi konsisten, konteks 128k |
+| s14_retry_enrich | 70b | Improvement butuh pengetahuan dalam |
+| s15_nutrition_vars | 70b | Kalkulasi nutrisi + kreativitas variasi |
+| s16_final_polish | 8b-fast | Assembly struktural, cepat |

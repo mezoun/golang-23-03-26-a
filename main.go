@@ -70,6 +70,12 @@ const (
 	storeFile   = "workers.gob"
 	flushWindow = 300 * time.Millisecond
 
+	// File manager — output folder
+	outputDir      = "output"
+	maxUploadBytes = 10 << 20 // 10 MB per file (aman untuk 1 GB RAM + banyak worker)
+	maxOutputFiles = 200      // max file di folder output
+	maxListFiles   = 500      // batas iterasi ReadDir
+
 	// Staggered start saat boot
 	staggerMinMs = 10
 	staggerMaxMs = 40
@@ -1439,6 +1445,222 @@ func requireJSON(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// ─────────────────────────────────────────────
+//  File Manager — /files/upload, /files/list,
+//                 /files/view, /files/delete
+// ─────────────────────────────────────────────
+
+// fileInfo adalah metadata file untuk respons JSON.
+type fileInfo struct {
+	Name    string    `json:"name"`
+	Size    int64     `json:"size_bytes"`
+	ModTime time.Time `json:"modified"`
+}
+
+// ensureOutputDir memastikan folder output ada.
+func ensureOutputDir() error {
+	return os.MkdirAll(outputDir, 0o755)
+}
+
+// safeFilename mencegah path traversal: hanya izinkan nama file tanpa
+// separator direktori apapun. Mengembalikan ("", false) jika tidak aman.
+func safeFilename(name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	clean := filepath.Base(filepath.Clean(name))
+	if clean == "." || clean == ".." || strings.ContainsAny(clean, "/\\") {
+		return "", false
+	}
+	return clean, true
+}
+
+// POST /files/upload
+// Content-Type: multipart/form-data, field name "file"
+//
+// Curl contoh:
+//
+//	curl -X POST http://localhost:8080/files/upload \
+//	     -F "file=@/path/to/yourfile.txt"
+func (a *App) handleFileUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errJSON(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+
+	// Batasi total body agar tidak kebanjiran RAM
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes+4096)
+
+	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
+		errJSON(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("file terlalu besar (maks %d MB) atau form tidak valid", maxUploadBytes>>20))
+		return
+	}
+	defer r.MultipartForm.RemoveAll() //nolint:errcheck
+
+	src, header, err := r.FormFile("file")
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, "field 'file' wajib ada")
+		return
+	}
+	defer src.Close()
+
+	filename, ok := safeFilename(header.Filename)
+	if !ok {
+		errJSON(w, http.StatusBadRequest, "nama file tidak valid")
+		return
+	}
+
+	if err := ensureOutputDir(); err != nil {
+		errJSON(w, http.StatusInternalServerError, "tidak dapat membuat folder output")
+		return
+	}
+
+	// Cek jumlah file yang sudah ada
+	entries, _ := os.ReadDir(outputDir)
+	fileCount := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			fileCount++
+		}
+	}
+	if fileCount >= maxOutputFiles {
+		errJSON(w, http.StatusInsufficientStorage,
+			fmt.Sprintf("folder output penuh (maks %d file)", maxOutputFiles))
+		return
+	}
+
+	dstPath := filepath.Join(outputDir, filename)
+	out, err := os.Create(dstPath)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "gagal membuat file")
+		return
+	}
+	defer out.Close()
+
+	written, err := io.Copy(out, src)
+	if err != nil {
+		out.Close()
+		os.Remove(dstPath)
+		errJSON(w, http.StatusInternalServerError, "gagal menulis file")
+		return
+	}
+
+	log.Printf("[files] upload: %s (%d bytes)", filename, written)
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"name":       filename,
+		"size_bytes": written,
+		"path":       dstPath,
+	})
+}
+
+// GET /files/list
+//
+// Curl contoh:
+//
+//	curl http://localhost:8080/files/list
+func (a *App) handleFileList(w http.ResponseWriter, r *http.Request) {
+	entries, err := os.ReadDir(outputDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSON(w, http.StatusOK, []fileInfo{})
+			return
+		}
+		errJSON(w, http.StatusInternalServerError, "tidak dapat membaca folder output")
+		return
+	}
+
+	result := make([]fileInfo, 0, len(entries))
+	for i, e := range entries {
+		if i >= maxListFiles {
+			break
+		}
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		result = append(result, fileInfo{
+			Name:    e.Name(),
+			Size:    info.Size(),
+			ModTime: info.ModTime(),
+		})
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// GET /files/view?name=<filename>
+// Mengirim file sebagai download (Content-Disposition: attachment).
+//
+// Curl contoh:
+//
+//	curl -O -J "http://localhost:8080/files/view?name=report.pdf"
+//	# atau sekadar tampilkan:
+//	curl "http://localhost:8080/files/view?name=data.json"
+func (a *App) handleFileView(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")
+	filename, ok := safeFilename(name)
+	if !ok {
+		errJSON(w, http.StatusBadRequest, "parameter 'name' tidak valid atau kosong")
+		return
+	}
+
+	fpath := filepath.Join(outputDir, filename)
+
+	info, err := os.Stat(fpath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			errJSON(w, http.StatusNotFound, "file tidak ditemukan")
+		} else {
+			errJSON(w, http.StatusInternalServerError, "tidak dapat mengakses file")
+		}
+		return
+	}
+	if info.IsDir() {
+		errJSON(w, http.StatusBadRequest, "bukan file")
+		return
+	}
+
+	// Paksa download; hapus header ini jika ingin inline di browser
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+filename+"\"")
+	http.ServeFile(w, r, fpath)
+}
+
+// DELETE /files/delete?name=<filename>
+//
+// Curl contoh:
+//
+//	curl -X DELETE "http://localhost:8080/files/delete?name=report.pdf"
+func (a *App) handleFileDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		errJSON(w, http.StatusMethodNotAllowed, "DELETE only")
+		return
+	}
+
+	name := r.URL.Query().Get("name")
+	filename, ok := safeFilename(name)
+	if !ok {
+		errJSON(w, http.StatusBadRequest, "parameter 'name' tidak valid atau kosong")
+		return
+	}
+
+	fpath := filepath.Join(outputDir, filename)
+	if _, err := os.Stat(fpath); os.IsNotExist(err) {
+		errJSON(w, http.StatusNotFound, "file tidak ditemukan")
+		return
+	}
+
+	if err := os.Remove(fpath); err != nil {
+		errJSON(w, http.StatusInternalServerError, "gagal menghapus file")
+		return
+	}
+
+	log.Printf("[files] delete: %s", filename)
+	writeJSON(w, http.StatusOK, map[string]string{"deleted": filename})
+}
+
 // POST /create
 func (a *App) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -1679,6 +1901,11 @@ func main() {
 	mux.HandleFunc("/delete", app.handleDelete)
 	mux.HandleFunc("/run", app.handleRun)
 	mux.HandleFunc("/stop", app.handleStop)
+	// File manager
+	mux.HandleFunc("/files/upload", app.handleFileUpload)
+	mux.HandleFunc("/files/list", app.handleFileList)
+	mux.HandleFunc("/files/view", app.handleFileView)
+	mux.HandleFunc("/files/delete", app.handleFileDelete)
 	mux.Handle("/", hooks)
 
 	// FASE 3-F: Staggered start — jeda random antar worker saat boot

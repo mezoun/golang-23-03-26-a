@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,40 +32,69 @@ const (
 	MethodPOST HTTPMethod = "POST"
 )
 
-// StepValue holds the config specific to each step type.
+// StepValue holds config for each step type.
 //
 //	log      → { "message": "..." }
-//	webhook  → { "method": "POST", "path": "/hook/order" }
+//	webhook  → { "method": "POST", "path": "/hook" }
 //	call_api → { "method": "POST", "url": "...", "headers": {}, "body": {} }
+//	branch   → { "cases": [...] }
 type StepValue struct {
-	Message string            `json:"message,omitempty"`
-	Method  HTTPMethod        `json:"method,omitempty"`
-	Path    string            `json:"path,omitempty"`
+	// log
+	Message string `json:"message,omitempty"`
+
+	// webhook & call_api
+	Method HTTPMethod `json:"method,omitempty"`
+
+	// webhook
+	Path string `json:"path,omitempty"`
+
+	// call_api
 	URL     string            `json:"url,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
 	Body    json.RawMessage   `json:"body,omitempty"`
+
+	// branch
+	// Cases dievaluasi berurutan — cocok pertama menang (if / elseif / else).
+	// Case tanpa "when" (atau when nil) = else, selalu cocok.
+	//
+	//   "when": { "left": "{{step.field}}", "op": "==", "right": "Pizza" }
+	//   "goto": "target_step_id"   ← lompat ke step ini jika cocok
+	//                                 kosong = lanjut sequential
+	//
+	// Op: ==  !=  >  <  >=  <=  contains  starts_with  ends_with
+	Cases []BranchCase `json:"cases,omitempty"`
 }
 
-// Step is a single unit of work inside a workflow.
+// BranchCase adalah satu cabang dalam step branch.
+type BranchCase struct {
+	When *Condition `json:"when,omitempty"` // nil = else
+	Goto string     `json:"goto,omitempty"` // step ID tujuan; "" = sequential
+}
+
+// Condition adalah satu ekspresi perbandingan.
+// Left dan Right mendukung template {{...}}.
+type Condition struct {
+	Left  string `json:"left"`
+	Op    string `json:"op"`
+	Right string `json:"right"`
+}
+
+// Step adalah satu unit kerja dalam workflow.
 //
-// Output (optional) — pre-parsed once at worker start, string leaves rendered
-// after step executes, stored in pipeline under step ID.
+// Next (opsional) — paksa lompat ke step ID ini setelah eksekusi step ini,
+// tanpa perlu branch. Berguna untuk skip block atau custom flow.
 type Step struct {
 	ID     string          `json:"id"`
 	Name   string          `json:"name,omitempty"`
-	Type   string          `json:"type"`
+	Type   string          `json:"type"` // "log" | "webhook" | "call_api" | "branch"
 	Value  *StepValue      `json:"value"`
 	Output json.RawMessage `json:"output,omitempty"`
+	Next   string          `json:"next,omitempty"` // opsional: paksa goto step ID ini
 
-	// parsedOutput is pre-parsed from Output at worker-start time.
-	// Not serialized — reconstructed on each run.
-	parsedOutput interface{} // nil if Output is empty
+	// runtime — tidak diserialisasi
+	parsedOutput interface{}
 }
 
-// WorkerMode controls restart behavior after all steps complete.
-//
-//	"once" — run once then stop (default)
-//	"loop" — restart automatically forever
 type WorkerMode string
 
 const (
@@ -83,11 +113,12 @@ type Worker struct {
 	Updated time.Time                    `json:"updated"`
 }
 
-// prepareSteps pre-parses each step's Output JSON once.
-// Call this before handing a worker to runWorker.
-func prepareSteps(steps []Step) []Step {
+// prepareSteps pre-parses Output JSON dan membangun stepID→index map.
+// Dipanggil sekali saat worker start — tidak diulang setiap loop iterasi.
+func prepareSteps(steps []Step) ([]Step, map[string]int) {
 	out := make([]Step, len(steps))
 	copy(out, steps)
+	idx := make(map[string]int, len(steps))
 	for i := range out {
 		if len(out[i].Output) > 0 {
 			var v interface{}
@@ -95,16 +126,15 @@ func prepareSteps(steps []Step) []Step {
 				out[i].parsedOutput = v
 			}
 		}
+		if out[i].ID != "" {
+			idx[out[i].ID] = i
+		}
 	}
-	return out
+	return out, idx
 }
 
 // ─────────────────────────────────────────────
-//  Storage — gob with async debounced flush
-//
-//  Writes are batched: a background goroutine flushes at most
-//  once per flushWindow after any dirty mark.
-//  This eliminates blocking disk I/O on every loop iteration.
+//  Storage — gob + async debounced flush
 // ─────────────────────────────────────────────
 
 const (
@@ -115,8 +145,8 @@ const (
 type Store struct {
 	mu    sync.RWMutex
 	data  map[string]*Worker
-	dirty atomic.Bool   // true = pending flush
-	wake  chan struct{} // signal flusher goroutine
+	dirty atomic.Bool
+	wake  chan struct{}
 }
 
 func openStore() (*Store, error) {
@@ -137,8 +167,7 @@ func openStore() (*Store, error) {
 		log.Printf("warn: store decode failed (%v), starting fresh", err)
 		s.data = make(map[string]*Worker)
 	}
-	// schema migration: drop workers with nil step values
-	stale := []string{}
+	var stale []string
 	for id, w := range s.data {
 		for _, step := range w.Steps {
 			if step.Value == nil {
@@ -155,13 +184,9 @@ func openStore() (*Store, error) {
 	return s, nil
 }
 
-// flusher is a background goroutine that debounces disk writes.
-// It waits for a wake signal, then sleeps flushWindow, then flushes once.
 func (s *Store) flusher() {
 	for range s.wake {
-		// debounce: wait for the window to drain any burst
 		time.Sleep(flushWindow)
-		// drain any extra wakes accumulated during the sleep
 		for {
 			select {
 			case <-s.wake:
@@ -181,8 +206,6 @@ func (s *Store) flusher() {
 	}
 }
 
-// markDirty marks the store as needing a flush and wakes the flusher.
-// Non-blocking — if flusher is already awake, the signal is dropped (that's fine).
 func (s *Store) markDirty() {
 	s.dirty.Store(true)
 	select {
@@ -222,7 +245,6 @@ func (s *Store) flushNow() error {
 	return os.Rename(tmpName, storeFile)
 }
 
-// Save stores a worker and schedules a flush (non-blocking).
 func (s *Store) Save(w *Worker) {
 	s.mu.Lock()
 	s.data[w.ID] = w
@@ -230,7 +252,6 @@ func (s *Store) Save(w *Worker) {
 	s.markDirty()
 }
 
-// Delete removes a worker and schedules a flush (non-blocking).
 func (s *Store) Delete(id string) {
 	s.mu.Lock()
 	delete(s.data, id)
@@ -256,7 +277,7 @@ func (s *Store) List() []*Worker {
 }
 
 // ─────────────────────────────────────────────
-//  pipelineCtx — goroutine-local step data
+//  pipelineCtx
 // ─────────────────────────────────────────────
 
 type pipelineCtx struct {
@@ -274,7 +295,6 @@ func (p *pipelineCtx) store(stepID string, data map[string]interface{}) {
 	p.Steps[stepID] = data
 }
 
-// reset clears and reuses the pipeline across loop iterations — avoids GC churn.
 func (p *pipelineCtx) reset() {
 	for k := range p.Steps {
 		delete(p.Steps, k)
@@ -282,7 +302,7 @@ func (p *pipelineCtx) reset() {
 }
 
 // ─────────────────────────────────────────────
-//  webhookRouter — dynamic O(1) dispatch table
+//  webhookRouter
 // ─────────────────────────────────────────────
 
 type hookEntry struct {
@@ -313,8 +333,6 @@ func (wr *webhookRouter) unregister(path string) {
 	wr.mu.Unlock()
 }
 
-// ServeHTTP is the catch-all "/" handler.
-// Body is limited to 1 MB to prevent OOM from large payloads.
 func (wr *webhookRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	wr.mu.RLock()
 	entry, ok := wr.entries[r.URL.Path]
@@ -329,10 +347,8 @@ func (wr *webhookRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Limit body to 1 MB — prevents OOM from large payloads.
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 
-	// Log body truncated to 256 bytes — avoids double-alloc on large bodies.
 	if len(body) > 256 {
 		log.Printf("[worker:%s] WEBHOOK %s %s | body: %s... (%d bytes)",
 			entry.workerID, r.Method, r.URL.Path, body[:256], len(body))
@@ -354,11 +370,9 @@ func (wr *webhookRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // ─────────────────────────────────────────────
-//  Runtime — goroutine per worker
+//  Runtime
 // ─────────────────────────────────────────────
 
-// loopSleep is a reusable timer for the loop restart delay.
-// Each worker goroutine owns one — avoids time.After allocation per iteration.
 var loopDelay = 50 * time.Millisecond
 
 type Runtime struct {
@@ -383,18 +397,15 @@ func (rt *Runtime) Start(w *Worker, store *Store, hooks *webhookRouter) {
 	ctx, cancel := context.WithCancel(context.Background())
 	rt.cancels[w.ID] = cancel
 
-	// Pre-parse step outputs once — not re-parsed each loop iteration.
-	preparedSteps := prepareSteps(w.Steps)
+	preparedSteps, stepIndex := prepareSteps(w.Steps)
 
 	go func() {
-		// Reuse pipelineCtx across iterations — reduces GC pressure.
 		pctx := newPipelineCtx()
-		// Reuse timer across iterations — eliminates time.After allocation.
 		timer := time.NewTimer(loopDelay)
 		timer.Stop()
 
 		for {
-			runWorker(ctx, w, preparedSteps, hooks, &pctx)
+			runWorker(ctx, w, preparedSteps, stepIndex, hooks, &pctx)
 			pctx.reset()
 
 			select {
@@ -413,7 +424,6 @@ func (rt *Runtime) Start(w *Worker, store *Store, hooks *webhookRouter) {
 			}
 
 			if mode == ModeLoop {
-				// ctx-aware sleep — reuse timer to avoid allocation
 				timer.Reset(loopDelay)
 				select {
 				case <-ctx.Done():
@@ -432,7 +442,6 @@ func (rt *Runtime) Start(w *Worker, store *Store, hooks *webhookRouter) {
 				continue
 			}
 
-			// once: completed naturally
 			if wk, ok := store.Get(w.ID); ok {
 				wk.Running = false
 				wk.Updated = time.Now()
@@ -462,26 +471,54 @@ func (rt *Runtime) IsRunning(id string) bool {
 	return ok
 }
 
-// runWorker executes one full pass through all steps.
-// pctx is passed in (and reused across loop iterations by the caller).
-// preparedSteps must already have parsedOutput populated.
-func runWorker(ctx context.Context, w *Worker, steps []Step, hooks *webhookRouter, pctx *pipelineCtx) {
+// ─────────────────────────────────────────────
+//  runWorker — index-based traversal dengan goto support
+//
+//  Traversal pakai pointer index `i` (bukan range) agar bisa di-jump
+//  oleh branch atau step.Next ke step ID manapun secara O(1).
+//
+//  Proteksi infinite loop: max jumpLimit jump per satu run.
+//  Jika terlampaui → log error + abort run (tidak crash server).
+// ─────────────────────────────────────────────
+
+const jumpLimit = 1000
+
+func runWorker(
+	ctx context.Context,
+	w *Worker,
+	steps []Step,
+	stepIndex map[string]int,
+	hooks *webhookRouter,
+	pctx *pipelineCtx,
+) {
 	vars := w.Vars
 	if vars == nil {
 		vars = map[string]map[string]string{}
 	}
 
-	for _, step := range steps {
+	jumps := 0
+	i := 0
+
+	for i < len(steps) {
 		select {
 		case <-ctx.Done():
 			log.Printf("[worker:%s] stopped", w.ID)
 			return
 		default:
 		}
+
+		step := steps[i]
+
 		if step.Value == nil {
+			i++
 			continue
 		}
+
+		nextIdx := i + 1 // default: sequential
+		jumped := false
+
 		switch step.Type {
+
 		case "webhook":
 			out := execWebhook(ctx, w.ID, step, hooks)
 			pctx.store(step.ID, out)
@@ -504,11 +541,138 @@ func runWorker(ctx context.Context, w *Worker, steps []Step, hooks *webhookRoute
 				pctx.store(step.ID, renderOutputParsed(step.parsedOutput, *pctx, vars))
 			}
 
+		case "branch":
+			gotoID := execBranch(w.ID, step, *pctx, vars)
+			if gotoID != "" {
+				if target, ok := stepIndex[gotoID]; ok {
+					jumps++
+					if jumps > jumpLimit {
+						log.Printf("[worker:%s][step:%s] BRANCH jump limit (%d) exceeded — aborting run",
+							w.ID, step.stepLabel(), jumpLimit)
+						return
+					}
+					nextIdx = target
+					jumped = true
+					log.Printf("[worker:%s][step:%s] BRANCH → goto %q (idx %d)",
+						w.ID, step.stepLabel(), gotoID, target)
+				} else {
+					log.Printf("[worker:%s][step:%s] BRANCH goto %q not found — sequential",
+						w.ID, step.stepLabel(), gotoID)
+				}
+			} else {
+				log.Printf("[worker:%s][step:%s] BRANCH → no case matched — sequential",
+					w.ID, step.stepLabel())
+			}
+
 		default:
 			log.Printf("[worker:%s][step:%s] unknown type: %q", w.ID, step.stepLabel(), step.Type)
 		}
+
+		// step.Next override (hanya aktif jika branch belum jump)
+		if !jumped && step.Next != "" {
+			if target, ok := stepIndex[step.Next]; ok {
+				jumps++
+				if jumps > jumpLimit {
+					log.Printf("[worker:%s][step:%s] NEXT jump limit (%d) exceeded — aborting run",
+						w.ID, step.stepLabel(), jumpLimit)
+					return
+				}
+				nextIdx = target
+				log.Printf("[worker:%s][step:%s] NEXT → goto %q (idx %d)",
+					w.ID, step.stepLabel(), step.Next, target)
+			}
+		}
+
+		i = nextIdx
 	}
+
 	log.Printf("[worker:%s] workflow completed", w.ID)
+}
+
+// ─────────────────────────────────────────────
+//  Branch executor
+//
+//  Evaluasi cases berurutan — cocok pertama menang.
+//  Return: step ID tujuan dari case yang cocok, atau "" jika tidak ada.
+// ─────────────────────────────────────────────
+
+func execBranch(workerID string, step Step, pctx pipelineCtx, vars map[string]map[string]string) string {
+	if step.Value == nil || len(step.Value.Cases) == 0 {
+		return ""
+	}
+	for i, c := range step.Value.Cases {
+		if c.When == nil {
+			// else — selalu cocok
+			log.Printf("[worker:%s][step:%s] BRANCH case[%d] else → goto %q",
+				workerID, step.stepLabel(), i, c.Goto)
+			return c.Goto
+		}
+		if evalCondition(c.When, pctx, vars) {
+			log.Printf("[worker:%s][step:%s] BRANCH case[%d] match (%q %s %q) → goto %q",
+				workerID, step.stepLabel(), i,
+				renderTemplate(c.When.Left, pctx, vars),
+				c.When.Op,
+				renderTemplate(c.When.Right, pctx, vars),
+				c.Goto)
+			return c.Goto
+		}
+	}
+	return ""
+}
+
+// evalCondition mengevaluasi satu Condition setelah render template.
+// Jika kedua sisi bisa di-parse float64 → numeric comparison.
+// Fallback ke string comparison.
+func evalCondition(c *Condition, pctx pipelineCtx, vars map[string]map[string]string) bool {
+	left := renderTemplate(c.Left, pctx, vars)
+	right := renderTemplate(c.Right, pctx, vars)
+	op := strings.TrimSpace(c.Op)
+
+	lf, lErr := strconv.ParseFloat(left, 64)
+	rf, rErr := strconv.ParseFloat(right, 64)
+	numeric := lErr == nil && rErr == nil
+
+	switch op {
+	case "==":
+		if numeric {
+			return lf == rf
+		}
+		return left == right
+	case "!=":
+		if numeric {
+			return lf != rf
+		}
+		return left != right
+	case ">":
+		if numeric {
+			return lf > rf
+		}
+		return left > right
+	case "<":
+		if numeric {
+			return lf < rf
+		}
+		return left < right
+	case ">=":
+		if numeric {
+			return lf >= rf
+		}
+		return left >= right
+	case "<=":
+		if numeric {
+			return lf <= rf
+		}
+		return left <= right
+	case "contains":
+		return strings.Contains(left, right)
+	case "starts_with":
+		return strings.HasPrefix(left, right)
+	case "ends_with":
+		return strings.HasSuffix(left, right)
+	default:
+		log.Printf("branch: unknown op %q — treated as false", op)
+		return false
+	}
 }
 
 // ─────────────────────────────────────────────
@@ -522,16 +686,74 @@ func (s Step) stepLabel() string {
 	return s.ID
 }
 
+func execWebhook(ctx context.Context, workerID string, step Step, hooks *webhookRouter) map[string]interface{} {
+	cfg := step.Value
+	fullPath := "/" + workerID + cfg.Path
+
+	arrived := make(chan map[string]interface{}, 1)
+	hooks.register(fullPath, string(cfg.Method), workerID, arrived)
+	defer hooks.unregister(fullPath)
+
+	select {
+	case bodyMap := <-arrived:
+		log.Printf("[worker:%s][step:%s] WEBHOOK triggered", workerID, step.stepLabel())
+		return bodyMap
+	case <-ctx.Done():
+		log.Printf("[worker:%s][step:%s] WEBHOOK cancelled", workerID, step.stepLabel())
+		return map[string]interface{}{}
+	}
+}
+
+var apiClient = &http.Client{Timeout: 30 * time.Second}
+
+func execCallAPI(ctx context.Context, workerID string, step Step, pctx pipelineCtx, vars map[string]map[string]string) map[string]interface{} {
+	cfg := step.Value
+	renderedURL := renderTemplate(cfg.URL, pctx, vars)
+
+	var reqBody io.Reader
+	if len(cfg.Body) > 0 {
+		renderedBody := renderTemplate(string(cfg.Body), pctx, vars)
+		reqBody = bytes.NewReader([]byte(renderedBody))
+	}
+	req, err := http.NewRequestWithContext(ctx, string(cfg.Method), renderedURL, reqBody)
+	if err != nil {
+		log.Printf("[worker:%s][step:%s] CALL_API build error: %v", workerID, step.stepLabel(), err)
+		return map[string]interface{}{}
+	}
+	if len(cfg.Body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range cfg.Headers {
+		req.Header.Set(k, renderTemplate(v, pctx, vars))
+	}
+
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		log.Printf("[worker:%s][step:%s] CALL_API error: %v", workerID, step.stepLabel(), err)
+		return map[string]interface{}{}
+	}
+	defer resp.Body.Close()
+
+	respRaw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+
+	if len(respRaw) > 256 {
+		log.Printf("[worker:%s][step:%s] CALL_API %s %s → HTTP %d | %s... (%d bytes)",
+			workerID, step.stepLabel(), cfg.Method, renderedURL, resp.StatusCode, respRaw[:256], len(respRaw))
+	} else {
+		log.Printf("[worker:%s][step:%s] CALL_API %s %s → HTTP %d | %s",
+			workerID, step.stepLabel(), cfg.Method, renderedURL, resp.StatusCode, respRaw)
+	}
+
+	out := make(map[string]interface{})
+	if err := json.Unmarshal(respRaw, &out); err != nil {
+		out["raw"] = string(respRaw)
+		out["status"] = resp.StatusCode
+	}
+	return out
+}
+
 // ─────────────────────────────────────────────
 //  Template rendering
-//
-//  Namespaces:
-//    {{bucket.key}}     → vars["bucket"]["key"]   (static)
-//    {{stepId.field}}   → pctx.Steps[stepId][field] (runtime)
-//    {{stepId.a.b}}     → nested dot-notation
-//
-//  Unknown tokens are written back as-is (Jinja2/Handlebars behavior).
-//  Iterates up to 20 passes until stable (for chained vars).
 // ─────────────────────────────────────────────
 
 func renderTemplate(s string, pctx pipelineCtx, vars map[string]map[string]string) string {
@@ -591,20 +813,15 @@ func resolveToken(inner string, pctx pipelineCtx, vars map[string]map[string]str
 	ns := inner[:dotIdx]
 	key := inner[dotIdx+1:]
 
-	// vars take priority over pipeline
 	if bucket, ok := vars[ns]; ok {
 		return bucket[key], true
 	}
-
 	if stepData, ok := pctx.Steps[ns]; ok {
 		return valueToString(resolveKey(key, stepData)), true
 	}
-
 	return "", false
 }
 
-// valueToString converts an interface value to string without fmt.Sprintf.
-// Avoids reflection-based allocation in the hot template path.
 func valueToString(v interface{}) string {
 	if v == nil {
 		return ""
@@ -618,7 +835,6 @@ func valueToString(v interface{}) string {
 		}
 		return "false"
 	case float64:
-		// JSON numbers decode as float64
 		if val == float64(int64(val)) {
 			return fmt.Sprintf("%d", int64(val))
 		}
@@ -647,8 +863,6 @@ func resolveKey(key string, data map[string]interface{}) interface{} {
 	return ""
 }
 
-// renderOutputParsed renders a pre-parsed Output tree (from step.parsedOutput).
-// No JSON parsing at runtime — only template substitution in string leaves.
 func renderOutputParsed(v interface{}, pctx pipelineCtx, vars map[string]map[string]string) map[string]interface{} {
 	rendered := renderValue(v, pctx, vars)
 	if m, ok := rendered.(map[string]interface{}); ok {
@@ -676,79 +890,6 @@ func renderValue(v interface{}, pctx pipelineCtx, vars map[string]map[string]str
 	default:
 		return v
 	}
-}
-
-func execWebhook(ctx context.Context, workerID string, step Step, hooks *webhookRouter) map[string]interface{} {
-	cfg := step.Value
-	fullPath := "/" + workerID + cfg.Path
-
-	arrived := make(chan map[string]interface{}, 1)
-	hooks.register(fullPath, string(cfg.Method), workerID, arrived)
-	defer hooks.unregister(fullPath)
-
-	select {
-	case bodyMap := <-arrived:
-		log.Printf("[worker:%s][step:%s] WEBHOOK triggered", workerID, step.stepLabel())
-		return bodyMap
-	case <-ctx.Done():
-		log.Printf("[worker:%s][step:%s] WEBHOOK cancelled", workerID, step.stepLabel())
-		return map[string]interface{}{}
-	}
-}
-
-// apiClient is a shared HTTP client with a 30s timeout.
-// Using DefaultClient (no timeout) risks goroutine leak on hung external APIs.
-var apiClient = &http.Client{
-	Timeout: 30 * time.Second,
-}
-
-func execCallAPI(ctx context.Context, workerID string, step Step, pctx pipelineCtx, vars map[string]map[string]string) map[string]interface{} {
-	cfg := step.Value
-	renderedURL := renderTemplate(cfg.URL, pctx, vars)
-
-	var reqBody io.Reader
-	if len(cfg.Body) > 0 {
-		renderedBody := renderTemplate(string(cfg.Body), pctx, vars)
-		reqBody = bytes.NewReader([]byte(renderedBody))
-	}
-	req, err := http.NewRequestWithContext(ctx, string(cfg.Method), renderedURL, reqBody)
-	if err != nil {
-		log.Printf("[worker:%s][step:%s] CALL_API build error: %v", workerID, step.stepLabel(), err)
-		return map[string]interface{}{}
-	}
-	if len(cfg.Body) > 0 {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	for k, v := range cfg.Headers {
-		req.Header.Set(k, renderTemplate(v, pctx, vars))
-	}
-
-	resp, err := apiClient.Do(req)
-	if err != nil {
-		log.Printf("[worker:%s][step:%s] CALL_API error: %v", workerID, step.stepLabel(), err)
-		return map[string]interface{}{}
-	}
-	defer resp.Body.Close()
-
-	// Limit response to 4 MB — prevents OOM from large API responses.
-	respRaw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-
-	// Log response truncated to 256 bytes.
-	// renderedURL dipakai (bukan cfg.URL) supaya log menampilkan URL aktual, bukan template mentah.
-	if len(respRaw) > 256 {
-		log.Printf("[worker:%s][step:%s] CALL_API %s %s → HTTP %d | %s... (%d bytes)",
-			workerID, step.stepLabel(), cfg.Method, renderedURL, resp.StatusCode, respRaw[:256], len(respRaw))
-	} else {
-		log.Printf("[worker:%s][step:%s] CALL_API %s %s → HTTP %d | %s",
-			workerID, step.stepLabel(), cfg.Method, renderedURL, resp.StatusCode, respRaw)
-	}
-
-	out := make(map[string]interface{})
-	if err := json.Unmarshal(respRaw, &out); err != nil {
-		out["raw"] = string(respRaw)
-		out["status"] = resp.StatusCode
-	}
-	return out
 }
 
 // ─────────────────────────────────────────────
@@ -790,6 +931,14 @@ func stepID() string {
 	return fmt.Sprintf("%08x", b)
 }
 
+func assignStepIDs(steps []Step) {
+	for i := range steps {
+		if steps[i].ID == "" {
+			steps[i].ID = stepID()
+		}
+	}
+}
+
 // POST /create
 func (a *App) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -804,11 +953,7 @@ func (a *App) handleCreate(w http.ResponseWriter, r *http.Request) {
 	if worker.ID == "" {
 		worker.ID = uniqueID()
 	}
-	for i := range worker.Steps {
-		if worker.Steps[i].ID == "" {
-			worker.Steps[i].ID = stepID()
-		}
-	}
+	assignStepIDs(worker.Steps)
 	worker.Created = time.Now()
 	worker.Updated = time.Now()
 	if worker.Mode == "" {
@@ -861,11 +1006,7 @@ func (a *App) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		a.runtime.Stop(updated.ID)
 		wasRunning = false
 	}
-	for i := range updated.Steps {
-		if updated.Steps[i].ID == "" {
-			updated.Steps[i].ID = stepID()
-		}
-	}
+	assignStepIDs(updated.Steps)
 	a.store.Save(&updated)
 	if updated.Running && !wasRunning {
 		a.runtime.Start(&updated, a.store, a.hooks)
@@ -936,14 +1077,7 @@ func (a *App) handleStop(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────────────────────────
 
 func main() {
-	// Tune Go runtime for 1 CPU core / 1 GB RAM environment.
-	// GOMAXPROCS(1): single-core — no scheduler overhead from OS thread switching.
-	// SetGCPercent(20): GC triggers sooner, keeping heap smaller at cost of slightly
-	//   more frequent (but shorter) GC cycles — better for RAM-constrained env.
 	runtime.GOMAXPROCS(1)
-	//nolint:staticcheck
-	// debug.SetGCPercent(20) — uncomment if using Go 1.19+ and want tighter GC.
-	// For now the default (100) is fine; GOMAXPROCS(1) already helps significantly.
 
 	store, err := openStore()
 	if err != nil {
@@ -963,7 +1097,6 @@ func main() {
 	mux.HandleFunc("/stop", app.handleStop)
 	mux.Handle("/", hooks)
 
-	// auto-start workers that were running before server restart
 	for _, w := range store.List() {
 		if w.Running {
 			log.Printf("auto-starting worker %s (%s)", w.ID, w.Name)
@@ -974,13 +1107,12 @@ func main() {
 	addr := ":8080"
 	log.Printf("worker-engine listening on %s", addr)
 
-	// HTTP server with timeouts — prevents connection exhaustion from slow/idle clients.
 	srv := &http.Server{
 		Addr:         addr,
 		Handler:      mux,
-		ReadTimeout:  15 * time.Second,  // time to read full request headers + body
-		WriteTimeout: 60 * time.Second,  // time to write full response (allow slow webhooks)
-		IdleTimeout:  120 * time.Second, // keep-alive idle connection lifetime
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)

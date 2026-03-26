@@ -1,83 +1,136 @@
-# curl Guide — Worker Engine
+# Worker Engine — curl Demo
 
-Base URL: `http://localhost:8080`
-
-> Semua body JSON harus satu baris untuk CLI compatibility (gunakan format di bawah).
+Ganti `YOUR_CF_ACCOUNT_ID` dan `YOUR_CF_TOKEN` sebelum dijalankan.
 
 ---
 
-## Create Worker
+## 1. Create Worker
 
 ```bash
-curl -X POST http://localhost:8080/create -H "Content-Type: application/json" -d '{
+curl -X POST http://localhost:8080/create \
+  -H "Content-Type: application/json" \
+  -d '{
   "name": "AI Food Worker",
   "mode": "loop",
   "running": true,
   "vars": {
+    "pvt": {
+      "cf_id":   "YOUR_CF_ACCOUNT_ID",
+      "cf_auth": "YOUR_CF_TOKEN"
+    },
     "glb": {
       "ai_model": "@cf/meta/llama-3.1-8b-instruct-fast",
-      "api_url": "https://api.cloudflare.com/client/v4/accounts/{{pvt.cf_id}}/ai/run/{{glb.ai_model}}"
-    },
-    "pvt": {
-      "cf_id": "56667d302adadb8e04093b1aac32017c",
-      "cf_auth": "cfut_KpdkVf3ZkIArmKDoBLQySa2TA4Pb5MXY4ZkXA7Qbe21abbbf"
+      "api_url":  "https://api.cloudflare.com/client/v4/accounts/{{pvt.cf_id}}/ai/run/{{glb.ai_model}}"
     }
   },
   "steps": [
     {
-      "id": "hook",
+      "id":   "hook",
       "name": "terima request",
       "type": "webhook",
-      "value": { "method": "POST", "path": "/food" }
+      "value": {
+        "method": "POST",
+        "path":   "/food"
+      },
+      "output": {
+        "sys":  "{{hook.sys}}",
+        "usr":  "{{hook.usr}}",
+        "meta": {
+          "model":  "{{glb.ai_model}}",
+          "source": "webhook"
+        }
+      }
     },
     {
+      "id":   "log_input",
       "name": "log input",
       "type": "log",
-      "value": { "message": "sys={{hook.sys}} usr={{hook.usr}}" }
+      "value": {
+        "message": "[INPUT] sys={{hook.sys}} | usr={{hook.usr}} | model={{glb.ai_model}}"
+      },
+      "output": {
+        "summary": "{{hook.sys}} / {{hook.usr}}",
+        "model":   "{{glb.ai_model}}"
+      }
     },
     {
-      "id": "ai",
+      "id":   "ai",
       "name": "tanya AI",
       "type": "call_api",
       "value": {
         "method": "POST",
-        "url": "{{glb.api_url}}",
-        "headers": { "Authorization": "Bearer {{pvt.cf_auth}}" },
+        "url":    "{{glb.api_url}}",
+        "headers": {
+          "Authorization": "Bearer {{pvt.cf_auth}}"
+        },
         "body": {
           "messages": [
             { "role": "system", "content": "{{hook.sys}}" },
             { "role": "user",   "content": "{{hook.usr}}" }
           ]
         }
+      },
+      "output": {
+        "answer": "{{ai.result.response}}",
+        "ok":     "{{ai.success}}",
+        "meta": {
+          "model":    "{{glb.ai_model}}",
+          "question": "{{hook.usr}}",
+          "sys":      "{{hook.sys}}"
+        }
       }
     },
     {
+      "id":   "log_result",
       "name": "log result",
       "type": "log",
-      "value": { "message": "AI jawab: {{ai.result.response}}" }
+      "value": {
+        "message": "[RESULT] model={{glb.ai_model}} | Q={{ai.meta.question}} | A={{ai.answer}} | ok={{ai.ok}}"
+      },
+      "output": {
+        "final":        "{{ai.answer}}",
+        "full_log":     "Q: {{ai.meta.question}} | A: {{ai.answer}}",
+        "unknown_test": "{{tidak.ada}}",
+        "debug": {
+          "model":           "{{glb.ai_model}}",
+          "ok":              "{{ai.ok}}",
+          "input_summary":   "{{log_input.summary}}",
+          "log_input_model": "{{log_input.model}}"
+        }
+      }
     }
   ]
 }'
 ```
 
-Simpan `id` dari response, contoh: `a3f2c1d4-e5b6-4a7f-8c9d-0e1f2a3b4c5d`
+Response berisi `id` — catat sebagai `WORKER_ID` untuk perintah berikutnya.
 
 ---
 
-## Trigger Webhook
+## 2. Trigger Webhook
 
-Format path: `/<workerID><path_dari_json>`
+Ganti `WORKER_ID` dengan `id` dari response create.
 
 ```bash
-# Kirim data — bisa dirujuk di step lain via {{hook.sys}}, {{hook.usr}}, dst
-curl -X POST http://localhost:8080/<workerID>/food \
+curl -X POST http://localhost:8080/WORKER_ID/food \
   -H "Content-Type: application/json" \
-  -d '{"sys":"jawab max 5 kata","usr":"makanan terenak di dunia?"}'
+  -d '{
+  "sys": "Jawab singkat dalam 1 kalimat.",
+  "usr": "Makanan terenak di dunia itu apa?"
+}'
 ```
 
 ---
 
-## List Semua Worker
+## 3. Get Worker
+
+```bash
+curl http://localhost:8080/get?id=WORKER_ID
+```
+
+---
+
+## 4. List Semua Worker
 
 ```bash
 curl http://localhost:8080/list
@@ -85,91 +138,100 @@ curl http://localhost:8080/list
 
 ---
 
-## Get Worker by ID
+## 5. Stop Worker
 
 ```bash
-curl "http://localhost:8080/get?id=<id>"
+curl -X POST http://localhost:8080/stop?id=WORKER_ID
 ```
 
 ---
 
-## Update Worker
+## 6. Run Worker
+
+```bash
+curl -X POST http://localhost:8080/run?id=WORKER_ID
+```
+
+---
+
+## 7. Update Worker
+
+Steps berubah → worker di-restart otomatis.
 
 ```bash
 curl -X PUT http://localhost:8080/update \
   -H "Content-Type: application/json" \
-  -d '{"id":"<id>","name":"Updated","mode":"loop","running":true,"vars":{...},"steps":[...]}'
+  -d '{
+  "id":      "WORKER_ID",
+  "name":    "AI Food Worker v2",
+  "mode":    "loop",
+  "running": true,
+  "vars": {
+    "pvt": {
+      "cf_id":   "YOUR_CF_ACCOUNT_ID",
+      "cf_auth": "YOUR_CF_TOKEN"
+    },
+    "glb": {
+      "ai_model": "@cf/meta/llama-3.1-8b-instruct-fast",
+      "api_url":  "https://api.cloudflare.com/client/v4/accounts/{{pvt.cf_id}}/ai/run/{{glb.ai_model}}"
+    }
+  },
+  "steps": [
+    {
+      "id":   "hook",
+      "name": "terima request",
+      "type": "webhook",
+      "value": { "method": "POST", "path": "/food" },
+      "output": {
+        "sys": "{{hook.sys}}",
+        "usr": "{{hook.usr}}"
+      }
+    },
+    {
+      "id":   "ai",
+      "name": "tanya AI",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url":    "{{glb.api_url}}",
+        "headers": { "Authorization": "Bearer {{pvt.cf_auth}}" },
+        "body": {
+          "messages": [
+            { "role": "user", "content": "{{hook.usr}}" }
+          ]
+        }
+      },
+      "output": {
+        "answer": "{{ai.result.response}}",
+        "ok":     "{{ai.success}}"
+      }
+    },
+    {
+      "type": "log",
+      "value": {
+        "message": "[v2] Q={{hook.usr}} | A={{ai.answer}} | ok={{ai.ok}}"
+      }
+    }
+  ]
+}'
 ```
-
-> Jika `steps` berubah dan worker sedang running, worker di-restart otomatis.
 
 ---
 
-## Run Worker
+## 8. Trigger Webhook (setelah update)
 
 ```bash
-curl -X POST "http://localhost:8080/run?id=<id>"
+curl -X POST http://localhost:8080/WORKER_ID/food \
+  -H "Content-Type: application/json" \
+  -d '{
+  "usr": "Minuman terenak itu apa?"
+}'
 ```
 
 ---
 
-## Stop Worker
+## 9. Delete Worker
 
 ```bash
-curl -X POST "http://localhost:8080/stop?id=<id>"
+curl -X DELETE http://localhost:8080/delete?id=WORKER_ID
 ```
-
----
-
-## Delete Worker
-
-```bash
-curl -X DELETE "http://localhost:8080/delete?id=<id>"
-```
-
----
-
-## Template Reference
-
-| Syntax | Sumber | Contoh |
-|--------|--------|--------|
-| `{{wadah.key}}` | `vars["wadah"]["key"]` | `{{glb.api_url}}` |
-| `{{stepId.field}}` | output step by ID | `{{hook.usr}}` |
-| `{{stepId.nested.field}}` | nested JSON response | `{{ai.result.response}}` |
-
-### Contoh referensi output `call_api`
-
-Jika response AI Cloudflare adalah:
-```json
-{ "result": { "response": "Pizza!" }, "success": true }
-```
-
-Maka step berikutnya bisa akses:
-```
-{{ai.result.response}}  →  "Pizza!"
-{{ai.success}}          →  "true"
-```
-
-Jika response bukan JSON, tersedia sebagai:
-```
-{{stepId.raw}}     → raw string response
-{{stepId.status}}  → HTTP status code
-```
-
----
-
-## Vars Cross-Reference
-
-Vars antar wadah bisa saling merujuk:
-
-```json
-"vars": {
-  "pvt": { "cf_id": "abc123" },
-  "glb": {
-    "base": "https://api.cloudflare.com/client/v4/accounts/{{pvt.cf_id}}",
-    "ai_url": "{{glb.base}}/ai/run/@cf/meta/llama-3.1-8b-instruct-fast"
-  }
-}
-```
-
-`{{glb.ai_url}}` akan resolved menjadi URL lengkap dengan `cf_id` dari `pvt`.

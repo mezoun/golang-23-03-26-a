@@ -10,3 +10,4 @@ doc-*.md
 README-*.md
 .notes*
 .curl-*.md
+.log*

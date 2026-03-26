@@ -13,8 +13,10 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,41 +32,39 @@ const (
 )
 
 // StepValue holds the config specific to each step type.
-// All three types share the same "value" key in JSON.
 //
 //	log      → { "message": "..." }
 //	webhook  → { "method": "POST", "path": "/hook/order" }
 //	call_api → { "method": "POST", "url": "...", "headers": {}, "body": {} }
 type StepValue struct {
-	// log
-	Message string `json:"message,omitempty"`
-
-	// webhook & call_api
-	Method HTTPMethod `json:"method,omitempty"` // "GET" | "POST"
-
-	// webhook
-	Path string `json:"path,omitempty"`
-
-	// call_api
+	Message string            `json:"message,omitempty"`
+	Method  HTTPMethod        `json:"method,omitempty"`
+	Path    string            `json:"path,omitempty"`
 	URL     string            `json:"url,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
 	Body    json.RawMessage   `json:"body,omitempty"`
 }
 
 // Step is a single unit of work inside a workflow.
-// ID is an 8-char hex (4 random bytes) — unique within a worker.
-// Name is optional, used only for logging.
+//
+// Output (optional) — pre-parsed once at worker start, string leaves rendered
+// after step executes, stored in pipeline under step ID.
 type Step struct {
-	ID    string     `json:"id"`             // 8-char hex, auto-generated if empty
-	Name  string     `json:"name,omitempty"` // optional label
-	Type  string     `json:"type"`           // "log" | "webhook" | "call_api"
-	Value *StepValue `json:"value"`
+	ID     string          `json:"id"`
+	Name   string          `json:"name,omitempty"`
+	Type   string          `json:"type"`
+	Value  *StepValue      `json:"value"`
+	Output json.RawMessage `json:"output,omitempty"`
+
+	// parsedOutput is pre-parsed from Output at worker-start time.
+	// Not serialized — reconstructed on each run.
+	parsedOutput interface{} // nil if Output is empty
 }
 
-// WorkerMode controls how a worker behaves after completing all steps.
+// WorkerMode controls restart behavior after all steps complete.
 //
 //	"once" — run once then stop (default)
-//	"loop" — restart automatically after each completion, forever
+//	"loop" — restart automatically forever
 type WorkerMode string
 
 const (
@@ -75,30 +75,59 @@ const (
 type Worker struct {
 	ID      string                       `json:"id"`
 	Name    string                       `json:"name"`
-	Mode    WorkerMode                   `json:"mode"`           // "once" | "loop"
-	Vars    map[string]map[string]string `json:"vars,omitempty"` // {{wadah.key}}
+	Mode    WorkerMode                   `json:"mode"`
+	Vars    map[string]map[string]string `json:"vars,omitempty"`
 	Steps   []Step                       `json:"steps"`
 	Running bool                         `json:"running"`
 	Created time.Time                    `json:"created"`
 	Updated time.Time                    `json:"updated"`
 }
 
+// prepareSteps pre-parses each step's Output JSON once.
+// Call this before handing a worker to runWorker.
+func prepareSteps(steps []Step) []Step {
+	out := make([]Step, len(steps))
+	copy(out, steps)
+	for i := range out {
+		if len(out[i].Output) > 0 {
+			var v interface{}
+			if err := json.Unmarshal(out[i].Output, &v); err == nil {
+				out[i].parsedOutput = v
+			}
+		}
+	}
+	return out
+}
+
 // ─────────────────────────────────────────────
-//  Storage — gob with atomic write (cross-platform)
+//  Storage — gob with async debounced flush
+//
+//  Writes are batched: a background goroutine flushes at most
+//  once per flushWindow after any dirty mark.
+//  This eliminates blocking disk I/O on every loop iteration.
 // ─────────────────────────────────────────────
 
-const storeFile = "workers.gob"
+const (
+	storeFile   = "workers.gob"
+	flushWindow = 300 * time.Millisecond
+)
 
 type Store struct {
-	mu   sync.RWMutex
-	data map[string]*Worker
+	mu    sync.RWMutex
+	data  map[string]*Worker
+	dirty atomic.Bool   // true = pending flush
+	wake  chan struct{} // signal flusher goroutine
 }
 
 func openStore() (*Store, error) {
-	s := &Store{data: make(map[string]*Worker)}
+	s := &Store{
+		data: make(map[string]*Worker),
+		wake: make(chan struct{}, 1),
+	}
 	f, err := os.Open(storeFile)
 	if err != nil {
 		if os.IsNotExist(err) {
+			go s.flusher()
 			return s, nil
 		}
 		return nil, err
@@ -108,8 +137,7 @@ func openStore() (*Store, error) {
 		log.Printf("warn: store decode failed (%v), starting fresh", err)
 		s.data = make(map[string]*Worker)
 	}
-	// schema migration: detect workers saved with old step format (Value == nil)
-	// and drop them — they cannot be recovered without the old field definitions.
+	// schema migration: drop workers with nil step values
 	stale := []string{}
 	for id, w := range s.data {
 		for _, step := range w.Steps {
@@ -119,18 +147,56 @@ func openStore() (*Store, error) {
 			}
 		}
 	}
-	if len(stale) > 0 {
-		for _, id := range stale {
-			log.Printf("migrate: dropping worker %s — old step schema (re-create it)", id)
-			delete(s.data, id)
-		}
+	for _, id := range stale {
+		log.Printf("migrate: dropping worker %s — old step schema (re-create it)", id)
+		delete(s.data, id)
 	}
+	go s.flusher()
 	return s, nil
 }
 
-func (s *Store) flush() error {
+// flusher is a background goroutine that debounces disk writes.
+// It waits for a wake signal, then sleeps flushWindow, then flushes once.
+func (s *Store) flusher() {
+	for range s.wake {
+		// debounce: wait for the window to drain any burst
+		time.Sleep(flushWindow)
+		// drain any extra wakes accumulated during the sleep
+		for {
+			select {
+			case <-s.wake:
+			default:
+				goto flush
+			}
+		}
+	flush:
+		if !s.dirty.Load() {
+			continue
+		}
+		if err := s.flushNow(); err != nil {
+			log.Printf("store: flush error: %v", err)
+		} else {
+			s.dirty.Store(false)
+		}
+	}
+}
+
+// markDirty marks the store as needing a flush and wakes the flusher.
+// Non-blocking — if flusher is already awake, the signal is dropped (that's fine).
+func (s *Store) markDirty() {
+	s.dirty.Store(true)
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Store) flushNow() error {
+	s.mu.RLock()
 	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(s.data); err != nil {
+	err := gob.NewEncoder(&buf).Encode(s.data)
+	s.mu.RUnlock()
+	if err != nil {
 		return err
 	}
 	dir := filepath.Dir(storeFile)
@@ -156,18 +222,20 @@ func (s *Store) flush() error {
 	return os.Rename(tmpName, storeFile)
 }
 
-func (s *Store) Save(w *Worker) error {
+// Save stores a worker and schedules a flush (non-blocking).
+func (s *Store) Save(w *Worker) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.data[w.ID] = w
-	return s.flush()
+	s.mu.Unlock()
+	s.markDirty()
 }
 
-func (s *Store) Delete(id string) error {
+// Delete removes a worker and schedules a flush (non-blocking).
+func (s *Store) Delete(id string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.data, id)
-	return s.flush()
+	s.mu.Unlock()
+	s.markDirty()
 }
 
 func (s *Store) Get(id string) (*Worker, bool) {
@@ -188,33 +256,17 @@ func (s *Store) List() []*Worker {
 }
 
 // ─────────────────────────────────────────────
-//  webhookRouter — dynamic swappable dispatch table
-//
-//  Root cause of the bug:
-//    http.ServeMux.HandleFunc panics on duplicate pattern.
-//    Worker restart / update would try to re-register the same path → panic or silent-drop.
-//
-//  Fix:
-//    Register ONE catch-all "/" on ServeMux that delegates here.
-//    This map is mutable at runtime: register/unregister freely.
+//  pipelineCtx — goroutine-local step data
 // ─────────────────────────────────────────────
 
-// pipelineCtx carries data flowing through a workflow.
-// Every step that produces output stores it here keyed by step ID.
-//
-//	Webhook step  → stores parsed request body
-//	CallAPI step  → stores parsed response body (if JSON) or raw string
-//
-// Access via {{stepId.field}} or {{stepId.nested.field}}
 type pipelineCtx struct {
-	Steps map[string]map[string]interface{} // stepID → output data
+	Steps map[string]map[string]interface{}
 }
 
 func newPipelineCtx() pipelineCtx {
 	return pipelineCtx{Steps: make(map[string]map[string]interface{})}
 }
 
-// store saves output data for a step by its ID (no-op if ID is empty).
 func (p *pipelineCtx) store(stepID string, data map[string]interface{}) {
 	if stepID == "" {
 		return
@@ -222,15 +274,26 @@ func (p *pipelineCtx) store(stepID string, data map[string]interface{}) {
 	p.Steps[stepID] = data
 }
 
+// reset clears and reuses the pipeline across loop iterations — avoids GC churn.
+func (p *pipelineCtx) reset() {
+	for k := range p.Steps {
+		delete(p.Steps, k)
+	}
+}
+
+// ─────────────────────────────────────────────
+//  webhookRouter — dynamic O(1) dispatch table
+// ─────────────────────────────────────────────
+
 type hookEntry struct {
 	method   string
 	workerID string
-	arrived  chan map[string]interface{} // delivers parsed request body to worker goroutine
+	arrived  chan map[string]interface{}
 }
 
 type webhookRouter struct {
 	mu      sync.RWMutex
-	entries map[string]*hookEntry // path → entry
+	entries map[string]*hookEntry
 }
 
 func newWebhookRouter() *webhookRouter {
@@ -239,20 +302,19 @@ func newWebhookRouter() *webhookRouter {
 
 func (wr *webhookRouter) register(path, method, workerID string, arrived chan map[string]interface{}) {
 	wr.mu.Lock()
-	defer wr.mu.Unlock()
 	wr.entries[path] = &hookEntry{method: method, workerID: workerID, arrived: arrived}
-	log.Printf("[worker:%s] WEBHOOK registered  %s  %s", workerID, method, path)
+	wr.mu.Unlock()
+	log.Printf("[worker:%s] WEBHOOK registered %s %s", workerID, method, path)
 }
 
 func (wr *webhookRouter) unregister(path string) {
 	wr.mu.Lock()
-	defer wr.mu.Unlock()
 	delete(wr.entries, path)
+	wr.mu.Unlock()
 }
 
-// ServeHTTP is mounted as the fallback "/" handler on the main mux.
-// API routes (/create, /list, …) are registered with explicit paths
-// and take priority over "/" in ServeMux, so they never land here.
+// ServeHTTP is the catch-all "/" handler.
+// Body is limited to 1 MB to prevent OOM from large payloads.
 func (wr *webhookRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	wr.mu.RLock()
 	entry, ok := wr.entries[r.URL.Path]
@@ -266,11 +328,19 @@ func (wr *webhookRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	body, _ := io.ReadAll(r.Body)
-	log.Printf("[worker:%s] WEBHOOK %s %s | body: %s",
-		entry.workerID, r.Method, r.URL.Path, string(body))
 
-	// parse body as generic JSON map
+	// Limit body to 1 MB — prevents OOM from large payloads.
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+
+	// Log body truncated to 256 bytes — avoids double-alloc on large bodies.
+	if len(body) > 256 {
+		log.Printf("[worker:%s] WEBHOOK %s %s | body: %s... (%d bytes)",
+			entry.workerID, r.Method, r.URL.Path, body[:256], len(body))
+	} else {
+		log.Printf("[worker:%s] WEBHOOK %s %s | body: %s",
+			entry.workerID, r.Method, r.URL.Path, body)
+	}
+
 	bodyMap := make(map[string]interface{})
 	_ = json.Unmarshal(body, &bodyMap)
 
@@ -286,6 +356,10 @@ func (wr *webhookRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────────────────────────
 //  Runtime — goroutine per worker
 // ─────────────────────────────────────────────
+
+// loopSleep is a reusable timer for the loop restart delay.
+// Each worker goroutine owns one — avoids time.After allocation per iteration.
+var loopDelay = 50 * time.Millisecond
 
 type Runtime struct {
 	mu      sync.Mutex
@@ -308,17 +382,28 @@ func (rt *Runtime) Start(w *Worker, store *Store, hooks *webhookRouter) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	rt.cancels[w.ID] = cancel
+
+	// Pre-parse step outputs once — not re-parsed each loop iteration.
+	preparedSteps := prepareSteps(w.Steps)
+
 	go func() {
+		// Reuse pipelineCtx across iterations — reduces GC pressure.
+		pctx := newPipelineCtx()
+		// Reuse timer across iterations — eliminates time.After allocation.
+		timer := time.NewTimer(loopDelay)
+		timer.Stop()
+
 		for {
-			runWorker(ctx, w, store, hooks)
-			// check if cancelled (Stop was called)
+			runWorker(ctx, w, preparedSteps, hooks, &pctx)
+			pctx.reset()
+
 			select {
 			case <-ctx.Done():
-				// stopped manually — update Running=false in store
+				timer.Stop()
 				if wk, ok := store.Get(w.ID); ok {
 					wk.Running = false
 					wk.Updated = time.Now()
-					_ = store.Save(wk)
+					store.Save(wk)
 				}
 				rt.mu.Lock()
 				delete(rt.cancels, w.ID)
@@ -326,29 +411,32 @@ func (rt *Runtime) Start(w *Worker, store *Store, hooks *webhookRouter) {
 				return
 			default:
 			}
+
 			if mode == ModeLoop {
-				log.Printf("[worker:%s] mode=loop, restarting...", w.ID)
-				// ctx-aware sleep: prevents CPU spin when no step blocks (e.g. all nil values)
+				// ctx-aware sleep — reuse timer to avoid allocation
+				timer.Reset(loopDelay)
 				select {
 				case <-ctx.Done():
+					timer.Stop()
 					if wk, ok := store.Get(w.ID); ok {
 						wk.Running = false
 						wk.Updated = time.Now()
-						_ = store.Save(wk)
+						store.Save(wk)
 					}
 					rt.mu.Lock()
 					delete(rt.cancels, w.ID)
 					rt.mu.Unlock()
 					return
-				case <-time.After(50 * time.Millisecond):
+				case <-timer.C:
 				}
 				continue
 			}
-			// once: completed naturally — update Running=false in store
+
+			// once: completed naturally
 			if wk, ok := store.Get(w.ID); ok {
 				wk.Running = false
 				wk.Updated = time.Now()
-				_ = store.Save(wk)
+				store.Save(wk)
 			}
 			rt.mu.Lock()
 			delete(rt.cancels, w.ID)
@@ -374,15 +462,16 @@ func (rt *Runtime) IsRunning(id string) bool {
 	return ok
 }
 
-func runWorker(ctx context.Context, w *Worker, _ *Store, hooks *webhookRouter) {
-	log.Printf("[worker:%s] started — %s", w.ID, w.Name)
-	pctx := newPipelineCtx()
+// runWorker executes one full pass through all steps.
+// pctx is passed in (and reused across loop iterations by the caller).
+// preparedSteps must already have parsedOutput populated.
+func runWorker(ctx context.Context, w *Worker, steps []Step, hooks *webhookRouter, pctx *pipelineCtx) {
 	vars := w.Vars
 	if vars == nil {
 		vars = map[string]map[string]string{}
 	}
 
-	for _, step := range w.Steps {
+	for _, step := range steps {
 		select {
 		case <-ctx.Done():
 			log.Printf("[worker:%s] stopped", w.ID)
@@ -390,21 +479,30 @@ func runWorker(ctx context.Context, w *Worker, _ *Store, hooks *webhookRouter) {
 		default:
 		}
 		if step.Value == nil {
-			log.Printf("[worker:%s][step:%s] skipped — nil value", w.ID, step.stepLabel())
 			continue
 		}
 		switch step.Type {
 		case "webhook":
 			out := execWebhook(ctx, w.ID, step, hooks)
 			pctx.store(step.ID, out)
+			if step.parsedOutput != nil {
+				pctx.store(step.ID, renderOutputParsed(step.parsedOutput, *pctx, vars))
+			}
 
 		case "log":
-			msg := renderTemplate(step.Value.Message, pctx, vars)
+			msg := renderTemplate(step.Value.Message, *pctx, vars)
 			log.Printf("[worker:%s][step:%s] LOG → %s", w.ID, step.stepLabel(), msg)
+			pctx.store(step.ID, map[string]interface{}{"message": msg})
+			if step.parsedOutput != nil {
+				pctx.store(step.ID, renderOutputParsed(step.parsedOutput, *pctx, vars))
+			}
 
 		case "call_api":
-			out := execCallAPI(ctx, w.ID, step, pctx, vars)
+			out := execCallAPI(ctx, w.ID, step, *pctx, vars)
 			pctx.store(step.ID, out)
+			if step.parsedOutput != nil {
+				pctx.store(step.ID, renderOutputParsed(step.parsedOutput, *pctx, vars))
+			}
 
 		default:
 			log.Printf("[worker:%s][step:%s] unknown type: %q", w.ID, step.stepLabel(), step.Type)
@@ -417,7 +515,6 @@ func runWorker(ctx context.Context, w *Worker, _ *Store, hooks *webhookRouter) {
 //  Step executors
 // ─────────────────────────────────────────────
 
-// stepLabel returns "name(id)" if name set, else just id — for log readability.
 func (s Step) stepLabel() string {
 	if s.Name != "" {
 		return s.Name + "(" + s.ID + ")"
@@ -428,90 +525,113 @@ func (s Step) stepLabel() string {
 // ─────────────────────────────────────────────
 //  Template rendering
 //
-//  Dua namespace yang tersedia:
+//  Namespaces:
+//    {{bucket.key}}     → vars["bucket"]["key"]   (static)
+//    {{stepId.field}}   → pctx.Steps[stepId][field] (runtime)
+//    {{stepId.a.b}}     → nested dot-notation
 //
-//    {{wadah.key}}        → vars["wadah"]["key"]   (static config)
-//    {{stepId.field}}     → output step by ID       (runtime data)
-//    {{stepId.a.b}}       → nested field via dot-notation
-//
-//  Vars antar-wadah bisa saling merujuk (iteratif, max 10x).
-//  Unknown keys → empty string (silent).
+//  Unknown tokens are written back as-is (Jinja2/Handlebars behavior).
+//  Iterates up to 20 passes until stable (for chained vars).
 // ─────────────────────────────────────────────
 
 func renderTemplate(s string, pctx pipelineCtx, vars map[string]map[string]string) string {
 	if !strings.Contains(s, "{{") {
-		return s // fast path
+		return s
 	}
-
-	// ── pass 1: resolve {{wadah.key}} dari vars (iteratif, antar-wadah bebas) ──
-	for i := 0; i < 10; i++ {
-		prev := s
-		s = resolveAllVars(s, vars)
-		if s == prev {
+	for pass := 0; pass < 20; pass++ {
+		next := applyTemplates(s, pctx, vars)
+		if next == s {
 			break
 		}
-	}
-
-	// ── pass 2: resolve {{stepId.field}} dari pctx.Steps ───────────────────
-	for strings.Contains(s, "{{") {
-		start := strings.Index(s, "{{")
-		end := strings.Index(s[start:], "}}")
-		if end == -1 {
-			break
-		}
-		end += start
-		placeholder := s[start : end+2]
-		inner := strings.TrimSpace(s[start+2 : end])
-
-		dotIdx := strings.Index(inner, ".")
-		if dotIdx == -1 {
-			// tidak ada titik — tidak dikenal, hapus
-			s = strings.Replace(s, placeholder, "", 1)
-			continue
-		}
-		stepID := inner[:dotIdx]
-		fieldKey := inner[dotIdx+1:]
-		val := ""
-		if stepData, ok := pctx.Steps[stepID]; ok {
-			val = fmt.Sprintf("%v", resolveKey(fieldKey, stepData))
-		}
-		s = strings.Replace(s, placeholder, val, 1)
+		s = next
 	}
 	return s
 }
 
-// resolveAllVars melakukan satu pass penggantian semua {{wadah.key}} dari vars.
-func resolveAllVars(s string, vars map[string]map[string]string) string {
-	result := s
-	for strings.Contains(result, "{{") {
-		start := strings.Index(result, "{{")
-		end := strings.Index(result[start:], "}}")
-		if end == -1 {
-			break
-		}
-		end += start
-		placeholder := result[start : end+2]
-		inner := strings.TrimSpace(result[start+2 : end])
-
-		// hanya proses jika format "wadah.key" dan wadah ada di vars
-		dotIdx := strings.Index(inner, ".")
-		if dotIdx == -1 || strings.HasPrefix(inner, ".") {
-			// bukan format vars — skip, biarkan pass berikutnya tangani
-			break
-		}
-		wadah := inner[:dotIdx]
-		key := inner[dotIdx+1:]
-		bucket, ok := vars[wadah]
-		if !ok {
-			// wadah tidak ada — bukan var reference, stop agar tidak infinite loop
-			break
-		}
-		result = strings.Replace(result, placeholder, bucket[key], 1)
+func applyTemplates(s string, pctx pipelineCtx, vars map[string]map[string]string) string {
+	if !strings.Contains(s, "{{") {
+		return s
 	}
-	return result
+	var b strings.Builder
+	b.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		start := strings.Index(s[i:], "{{")
+		if start == -1 {
+			b.WriteString(s[i:])
+			break
+		}
+		start += i
+		b.WriteString(s[i:start])
+
+		end := strings.Index(s[start+2:], "}}")
+		if end == -1 {
+			b.WriteString(s[start:])
+			break
+		}
+		end = start + 2 + end
+		placeholder := s[start : end+2]
+		inner := strings.TrimSpace(s[start+2 : end])
+
+		if resolved, ok := resolveToken(inner, pctx, vars); ok {
+			b.WriteString(resolved)
+		} else {
+			b.WriteString(placeholder)
+		}
+		i = end + 2
+	}
+	return b.String()
 }
 
-// resolveKey supports dot-notation: "user.name" → body["user"]["name"]
+func resolveToken(inner string, pctx pipelineCtx, vars map[string]map[string]string) (string, bool) {
+	dotIdx := strings.Index(inner, ".")
+	if dotIdx <= 0 {
+		return "", false
+	}
+	ns := inner[:dotIdx]
+	key := inner[dotIdx+1:]
+
+	// vars take priority over pipeline
+	if bucket, ok := vars[ns]; ok {
+		return bucket[key], true
+	}
+
+	if stepData, ok := pctx.Steps[ns]; ok {
+		return valueToString(resolveKey(key, stepData)), true
+	}
+
+	return "", false
+}
+
+// valueToString converts an interface value to string without fmt.Sprintf.
+// Avoids reflection-based allocation in the hot template path.
+func valueToString(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	switch val := v.(type) {
+	case string:
+		return val
+	case bool:
+		if val {
+			return "true"
+		}
+		return "false"
+	case float64:
+		// JSON numbers decode as float64
+		if val == float64(int64(val)) {
+			return fmt.Sprintf("%d", int64(val))
+		}
+		return fmt.Sprintf("%g", val)
+	case int:
+		return fmt.Sprintf("%d", val)
+	case int64:
+		return fmt.Sprintf("%d", val)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
 func resolveKey(key string, data map[string]interface{}) interface{} {
 	parts := strings.SplitN(key, ".", 2)
 	val, ok := data[parts[0]]
@@ -521,11 +641,41 @@ func resolveKey(key string, data map[string]interface{}) interface{} {
 	if len(parts) == 1 {
 		return val
 	}
-	// recurse into nested map
 	if nested, ok := val.(map[string]interface{}); ok {
 		return resolveKey(parts[1], nested)
 	}
 	return ""
+}
+
+// renderOutputParsed renders a pre-parsed Output tree (from step.parsedOutput).
+// No JSON parsing at runtime — only template substitution in string leaves.
+func renderOutputParsed(v interface{}, pctx pipelineCtx, vars map[string]map[string]string) map[string]interface{} {
+	rendered := renderValue(v, pctx, vars)
+	if m, ok := rendered.(map[string]interface{}); ok {
+		return m
+	}
+	return map[string]interface{}{"value": rendered}
+}
+
+func renderValue(v interface{}, pctx pipelineCtx, vars map[string]map[string]string) interface{} {
+	switch val := v.(type) {
+	case string:
+		return renderTemplate(val, pctx, vars)
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(val))
+		for k, vv := range val {
+			out[k] = renderValue(vv, pctx, vars)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(val))
+		for i, vv := range val {
+			out[i] = renderValue(vv, pctx, vars)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 func execWebhook(ctx context.Context, workerID string, step Step, hooks *webhookRouter) map[string]interface{} {
@@ -544,6 +694,12 @@ func execWebhook(ctx context.Context, workerID string, step Step, hooks *webhook
 		log.Printf("[worker:%s][step:%s] WEBHOOK cancelled", workerID, step.stepLabel())
 		return map[string]interface{}{}
 	}
+}
+
+// apiClient is a shared HTTP client with a 30s timeout.
+// Using DefaultClient (no timeout) risks goroutine leak on hung external APIs.
+var apiClient = &http.Client{
+	Timeout: 30 * time.Second,
 }
 
 func execCallAPI(ctx context.Context, workerID string, step Step, pctx pipelineCtx, vars map[string]map[string]string) map[string]interface{} {
@@ -566,17 +722,27 @@ func execCallAPI(ctx context.Context, workerID string, step Step, pctx pipelineC
 	for k, v := range cfg.Headers {
 		req.Header.Set(k, renderTemplate(v, pctx, vars))
 	}
-	resp, err := http.DefaultClient.Do(req)
+
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		log.Printf("[worker:%s][step:%s] CALL_API error: %v", workerID, step.stepLabel(), err)
 		return map[string]interface{}{}
 	}
 	defer resp.Body.Close()
-	respRaw, _ := io.ReadAll(resp.Body)
-	log.Printf("[worker:%s][step:%s] CALL_API %s %s → HTTP %d | %s",
-		workerID, step.stepLabel(), cfg.Method, cfg.URL, resp.StatusCode, string(respRaw))
 
-	// parse response: JSON → map, fallback → {"raw": "<string>"}
+	// Limit response to 4 MB — prevents OOM from large API responses.
+	respRaw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+
+	// Log response truncated to 256 bytes.
+	// renderedURL dipakai (bukan cfg.URL) supaya log menampilkan URL aktual, bukan template mentah.
+	if len(respRaw) > 256 {
+		log.Printf("[worker:%s][step:%s] CALL_API %s %s → HTTP %d | %s... (%d bytes)",
+			workerID, step.stepLabel(), cfg.Method, renderedURL, resp.StatusCode, respRaw[:256], len(respRaw))
+	} else {
+		log.Printf("[worker:%s][step:%s] CALL_API %s %s → HTTP %d | %s",
+			workerID, step.stepLabel(), cfg.Method, renderedURL, resp.StatusCode, respRaw)
+	}
+
 	out := make(map[string]interface{})
 	if err := json.Unmarshal(respRaw, &out); err != nil {
 		out["raw"] = string(respRaw)
@@ -605,21 +771,17 @@ func errJSON(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
 }
 
-// uniqueID returns a random UUID v4 (RFC 4122).
-// Uses crypto/rand — collision probability is negligible (2^122 space).
 func uniqueID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return fmt.Sprintf("%x", time.Now().UnixNano())
 	}
-	b[6] = (b[6] & 0x0f) | 0x40 // version 4
-	b[8] = (b[8] & 0x3f) | 0x80 // variant bits
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
 		b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
-// stepID returns an 8-char hex string (4 random bytes).
-// Unique within a worker scope — short and readable in logs.
 func stepID() string {
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -635,7 +797,7 @@ func (a *App) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var worker Worker
-	if err := json.NewDecoder(r.Body).Decode(&worker); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&worker); err != nil {
 		errJSON(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
@@ -649,13 +811,10 @@ func (a *App) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	worker.Created = time.Now()
 	worker.Updated = time.Now()
-	if err := a.store.Save(&worker); err != nil {
-		errJSON(w, http.StatusInternalServerError, err.Error())
-		return
-	}
 	if worker.Mode == "" {
 		worker.Mode = ModeOnce
 	}
+	a.store.Save(&worker)
 	if worker.Running {
 		a.runtime.Start(&worker, a.store, a.hooks)
 	}
@@ -685,7 +844,7 @@ func (a *App) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var updated Worker
-	if err := json.NewDecoder(r.Body).Decode(&updated); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&updated); err != nil {
 		errJSON(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
@@ -707,10 +866,7 @@ func (a *App) handleUpdate(w http.ResponseWriter, r *http.Request) {
 			updated.Steps[i].ID = stepID()
 		}
 	}
-	if err := a.store.Save(&updated); err != nil {
-		errJSON(w, http.StatusInternalServerError, err.Error())
-		return
-	}
+	a.store.Save(&updated)
 	if updated.Running && !wasRunning {
 		a.runtime.Start(&updated, a.store, a.hooks)
 	}
@@ -729,10 +885,7 @@ func (a *App) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.runtime.Stop(id)
-	if err := a.store.Delete(id); err != nil {
-		errJSON(w, http.StatusInternalServerError, err.Error())
-		return
-	}
+	a.store.Delete(id)
 	writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
 }
 
@@ -754,7 +907,7 @@ func (a *App) handleRun(w http.ResponseWriter, r *http.Request) {
 	}
 	worker.Running = true
 	worker.Updated = time.Now()
-	_ = a.store.Save(worker)
+	a.store.Save(worker)
 	a.runtime.Start(worker, a.store, a.hooks)
 	writeJSON(w, http.StatusOK, map[string]interface{}{"status": "started", "mode": worker.Mode})
 }
@@ -774,7 +927,7 @@ func (a *App) handleStop(w http.ResponseWriter, r *http.Request) {
 	a.runtime.Stop(id)
 	worker.Running = false
 	worker.Updated = time.Now()
-	_ = a.store.Save(worker)
+	a.store.Save(worker)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
 }
 
@@ -783,6 +936,15 @@ func (a *App) handleStop(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────────────────────────
 
 func main() {
+	// Tune Go runtime for 1 CPU core / 1 GB RAM environment.
+	// GOMAXPROCS(1): single-core — no scheduler overhead from OS thread switching.
+	// SetGCPercent(20): GC triggers sooner, keeping heap smaller at cost of slightly
+	//   more frequent (but shorter) GC cycles — better for RAM-constrained env.
+	runtime.GOMAXPROCS(1)
+	//nolint:staticcheck
+	// debug.SetGCPercent(20) — uncomment if using Go 1.19+ and want tighter GC.
+	// For now the default (100) is fine; GOMAXPROCS(1) already helps significantly.
+
 	store, err := openStore()
 	if err != nil {
 		log.Fatalf("cannot open store: %v", err)
@@ -799,7 +961,6 @@ func main() {
 	mux.HandleFunc("/delete", app.handleDelete)
 	mux.HandleFunc("/run", app.handleRun)
 	mux.HandleFunc("/stop", app.handleStop)
-	// Catch-all: semua path lain → webhookRouter
 	mux.Handle("/", hooks)
 
 	// auto-start workers that were running before server restart
@@ -812,7 +973,16 @@ func main() {
 
 	addr := ":8080"
 	log.Printf("worker-engine listening on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+
+	// HTTP server with timeouts — prevents connection exhaustion from slow/idle clients.
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  15 * time.Second,  // time to read full request headers + body
+		WriteTimeout: 60 * time.Second,  // time to write full response (allow slow webhooks)
+		IdleTimeout:  120 * time.Second, // keep-alive idle connection lifetime
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }

@@ -15,11 +15,11 @@
 <br/>
 
 Define workflows in JSON. Run them as isolated workers.  
-**Webhook → Log → Call API** — with dynamic data pipeline, in one file, zero `go get`.
+**Webhook → Call API → Log** — with a full data pipeline, vars system, and zero `go get`.
 
 <br/>
 
-[**Quick Start**](#-quick-start) · [**Pipeline & Templates**](#-pipeline--templates) · [**API Reference**](#-api-reference) · [**Workflow Examples**](#-workflow-examples) · [**How It Works**](#-how-it-works) · [**Documentation**](DOCUMENTATION.md)
+[**Quick Start**](#-quick-start) · [**Pipeline**](#-pipeline--data-flow) · [**Vars**](#-vars-system) · [**API**](#-api-reference) · [**Docs**](doc.md) · [**curl Guide**](curl.md)
 
 </div>
 
@@ -27,139 +27,129 @@ Define workflows in JSON. Run them as isolated workers.
 
 ## ✨ Features
 
-| Feature | Description |
-|---------|-------------|
-| 🪝 **Webhook** | Accept incoming `GET` or `POST` requests as workflow triggers |
-| 🖨️ **Console Log** | Print messages to server stdout — supports `{{.field}}` templates |
-| 🌐 **Call API** | Hit external URLs — method, headers, body, URL all support templates |
-| 🔀 **Data Pipeline** | Webhook body flows into every subsequent step via `pipelineCtx` |
-| 🔁 **Worker Modes** | `once` — run once; `loop` — restart automatically forever |
-| 💾 **Persistent** | Workers survive server restarts via `gob` storage |
-| ♻️ **Auto-restart** | Running workers resume automatically on startup |
-| 🔁 **Full CRUD** | Create, read, update, delete workers via REST |
-| ▶️ **Run / Stop** | Start or stop any worker at runtime |
-| 🔒 **No Collisions** | Webhook paths are namespaced by worker UUID |
+| | Feature | Description |
+|-|---------|-------------|
+| 🪝 | **Webhook** | Accept `GET`/`POST` — request body flows into pipeline automatically |
+| 🌐 | **Call API** | Hit external URLs — response body flows into pipeline for next steps |
+| 🖨️ | **Log** | Print messages to stdout with `{{stepId.field}}` templates |
+| 🔀 | **Data Pipeline** | Every step's output stored by ID, accessible in all subsequent steps |
+| 📦 | **Vars System** | Multi-bucket static config — cross-reference between buckets freely |
+| 🔁 | **Worker Modes** | `once` — run once; `loop` — restart automatically forever |
+| 💾 | **Persistent** | Workers survive restarts via `gob` storage |
+| ♻️ | **Auto-resume** | Running workers restart automatically on server startup |
+| 🔒 | **No Collisions** | Webhook paths namespaced by worker UUID |
 
 ---
 
 ## 🚀 Quick Start
 
-### 1. Run
-
 ```bash
 go run main.go
 ```
 
-> Server starts on `:8080`. No config needed. `workers.gob` is created automatically.
-
-### 2. Create a worker
+```bash
+curl -X POST http://localhost:8080/create -H "Content-Type: application/json" -d '{
+  "name": "AI Worker",
+  "mode": "loop",
+  "running": true,
+  "vars": {
+    "pvt": { "cf_id": "YOUR_ID", "token": "YOUR_TOKEN" },
+    "glb": {
+      "model": "@cf/meta/llama-3.1-8b-instruct-fast",
+      "url": "https://api.cloudflare.com/client/v4/accounts/{{pvt.cf_id}}/ai/run/{{glb.model}}"
+    }
+  },
+  "steps": [
+    { "id": "hook", "type": "webhook", "value": { "method": "POST", "path": "/ask" } },
+    { "id": "ai",   "type": "call_api", "value": {
+        "method": "POST",
+        "url": "{{glb.url}}",
+        "headers": { "Authorization": "Bearer {{pvt.token}}" },
+        "body": { "messages": [{ "role": "user", "content": "{{hook.question}}" }] }
+    }},
+    { "type": "log", "value": { "message": "Answer: {{ai.result.response}}" } }
+  ]
+}'
+```
 
 ```bash
-curl -X POST http://localhost:8080/create \
+# Trigger — data flows through all steps
+curl -X POST http://localhost:8080/<workerID>/ask \
   -H "Content-Type: application/json" \
-  -d '{
-    "name": "My First Worker",
-    "mode": "once",
-    "running": true,
-    "steps": [
-      { "type": "webhook",  "webhook":  { "method": "POST", "path": "/hook/hello" } },
-      { "type": "log",      "log":      { "message": "Got message: {{.msg}}" } },
-      { "type": "call_api", "call_api": { "method": "GET", "url": "https://httpbin.org/get" } }
-    ]
-  }'
+  -d '{"question": "What is the best food?"}'
 ```
 
-Copy the `id` from the response.
-
-### 3. Trigger the webhook with data
-
-```bash
-curl -X POST http://localhost:8080/<id>/hook/hello \
-  -H "Content-Type: application/json" \
-  -d '{"msg": "hello world"}'
 ```
-
-### 4. Watch the server console
-
-```
-[worker:a3f2c1d4-...] started — My First Worker
-[worker:a3f2c1d4-...] WEBHOOK registered  POST  /a3f2c1d4-.../hook/hello
-[worker:a3f2c1d4-...] WEBHOOK POST /a3f2c1d4-.../hook/hello | body: {"msg":"hello world"}
-[worker:a3f2c1d4-...] WEBHOOK triggered, continuing workflow
-[worker:a3f2c1d4-...] LOG → Got message: hello world
-[worker:a3f2c1d4-...] CALL_API GET https://httpbin.org/get → HTTP 200 | ...
-[worker:a3f2c1d4-...] workflow completed
+[worker:...] WEBHOOK triggered
+[worker:...] CALL_API POST https://... → HTTP 200 | {"result":{"response":"Pizza!"}...}
+[worker:...] LOG → Answer: Pizza!
+[worker:...] workflow completed
+[worker:...] mode=loop, restarting...
 ```
 
 ---
 
-## 🔀 Pipeline & Templates
+## 🔀 Pipeline & Data Flow
 
-Webhook body is automatically passed to every subsequent step via `pipelineCtx`. Use `{{.field}}` anywhere in `log`, `call_api` URL, headers, or body.
+Every step that produces output stores it in the pipeline, keyed by its `id`. Subsequent steps can reference any previous step's output.
 
 ```
-POST /hook  ←  {"sys": "answer briefly", "usr": "what is coffee?"}
-                                │
-                         pipelineCtx
-                                │
-              ┌─────────────────┼─────────────────┐
-              ▼                 ▼                  ▼
-         log message      call_api url       call_api body
-        "{{.usr}}"    "…/{{.endpoint}}"   {"content":"{{.sys}}"}
+Step: webhook  (id="hook")
+  ← POST body: {"sys":"answer briefly", "usr":"best food?"}
+  → pipeline["hook"] = {"sys":"answer briefly", "usr":"best food?"}
+
+Step: call_api  (id="ai")
+  → body rendered: {{hook.sys}} → "answer briefly"
+  ← response: {"result": {"response": "Pizza!"}, "success": true}
+  → pipeline["ai"] = {"result": {"response": "Pizza!"}, "success": true}
+
+Step: log
+  → "{{ai.result.response}}"  renders to  "Pizza!"
 ```
 
 ### Template Syntax
 
-| Syntax | Result |
-|--------|--------|
-| `{{.field}}` | Top-level field from webhook body |
-| `{{.field.sub}}` | Nested field (dot-notation) |
-| No `{{` | Returned as-is — zero overhead |
+| Syntax | Source | Example |
+|--------|--------|---------|
+| `{{stepId.field}}` | Step output by ID | `{{hook.username}}` |
+| `{{stepId.a.b}}` | Nested dot-notation | `{{ai.result.response}}` |
+| `{{bucket.key}}` | `vars["bucket"]["key"]` | `{{glb.api_url}}` |
 
-### Supported In
+> **There is no `{{.field}}`** — every reference must be explicit. This makes workflows unambiguous and easy to trace.
 
-| Step | Supported fields |
-|------|-----------------|
-| `log` | `message` |
-| `call_api` | `url`, all `headers` values, entire `body` JSON |
+### call_api Response
 
-### Example
+```jsonc
+// Response: {"result": {"response": "Pizza!"}, "success": true}
+"{{ai.result.response}}"  →  "Pizza!"
+"{{ai.success}}"          →  "true"
 
-```bash
-# Create a dynamic AI worker
-curl -X POST http://localhost:8080/create -H "Content-Type: application/json" \
-  -d '{"name":"AI Worker","mode":"loop","running":true,"steps":[{"type":"webhook","webhook":{"method":"POST","path":"/ai"}},{"type":"log","log":{"message":"sys={{.sys}} usr={{.usr}}"}},{"type":"call_api","call_api":{"method":"POST","url":"https://api.example.com/ai","headers":{"Authorization":"Bearer TOKEN"},"body":{"messages":[{"role":"system","content":"{{.sys}}"},{"role":"user","content":"{{.usr}}"}]}}}]}'
-
-# Trigger with dynamic data — different every time
-curl -X POST http://localhost:8080/<id>/ai \
-  -H "Content-Type: application/json" \
-  -d '{"sys":"answer in max 5 words","usr":"what is the best food?"}'
+// Non-JSON response fallback:
+"{{ai.raw}}"    →  raw string body
+"{{ai.status}}" →  HTTP status code
 ```
 
 ---
 
-## 🔄 Worker Modes
+## 📦 Vars System
 
-| Mode | `running` | Behavior after completion |
-|------|-----------|--------------------------|
-| `"once"` *(default)* | `true` | Stops, `running` → `false`. Use `/run` to start again |
-| `"loop"` | `true` | Restarts automatically, `running` stays `true` forever |
-| *(any)* | `false` | Stored but idle. Use `/run` to start anytime |
+Static configuration in named buckets — cross-reference freely between buckets.
 
-```bash
-# Run once — great for one-shot workflows
-curl -X POST http://localhost:8080/create -H "Content-Type: application/json" \
-  -d '{"name":"one shot","mode":"once","running":true,"steps":[...]}'
-
-# Loop forever — great for always-on webhook listeners
-curl -X POST http://localhost:8080/create -H "Content-Type: application/json" \
-  -d '{"name":"always on","mode":"loop","running":true,"steps":[...]}'
-
-# Start idle — run manually later
-curl -X POST http://localhost:8080/create -H "Content-Type: application/json" \
-  -d '{"name":"manual","running":false,"steps":[...]}'
-curl -X POST "http://localhost:8080/run?id=<id>"
+```json
+"vars": {
+  "pvt": {
+    "cf_id":   "56667d302...",
+    "cf_auth": "cfut_Kpdk..."
+  },
+  "glb": {
+    "ai_model": "@cf/meta/llama-3.1-8b-instruct-fast",
+    "api_url":  "https://api.cloudflare.com/client/v4/accounts/{{pvt.cf_id}}/ai/run/{{glb.ai_model}}"
+  },
+  "env": { "timeout": "30", "region": "asia" }
+}
 ```
+
+`{{glb.api_url}}` resolves fully — `{{pvt.cf_id}}` inside it is substituted first. Buckets can reference each other, resolved iteratively. Bucket names are just conventions — there is no built-in privacy distinction.
 
 ---
 
@@ -168,21 +158,17 @@ curl -X POST "http://localhost:8080/run?id=<id>"
 ```
 ┌──────────────────────────────────────────────────────────┐
 │                    HTTP Server :8080                     │
-│                                                          │
 │  ServeMux                                                │
 │  ├─ /create /list /get /update /delete /run /stop        │
-│  └─ /  ──────────────────────► webhookRouter             │
-│                                  map[path → hookEntry]   │
-│                                  chan pipelineCtx  O(1)  │
+│  └─ /  ──────────────► webhookRouter  O(1) map lookup    │
+│                          chan map[string]interface{}      │
 ├──────────────────────────────────────────────────────────┤
-│  Runtime          (goroutine per worker)                 │
-│  ├─ worker-A  ──  webhook → pipelineCtx → log → call_api │
-│  ├─ worker-B  ──  step① → step②                         │
-│  └─ worker-C  ──  loop: restart after each completion    │
+│  Runtime  (goroutine per worker)                         │
+│  pipelineCtx: map[stepID → output]  goroutine-local      │
+│  vars: resolved once per run, immutable during steps     │
 ├──────────────────────────────────────────────────────────┤
 │  Store                                                   │
-│  map[id → *Worker]  in-memory  sync.RWMutex              │
-│  flush: gob encode → CreateTemp → fsync → Rename         │
+│  in-memory map + gob atomic write (CreateTemp→Rename)    │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -191,127 +177,74 @@ curl -X POST "http://localhost:8080/run?id=<id>"
 ## ⚡ How It Works
 
 <details>
-<summary><strong>Storage — Gob + Atomic Write</strong></summary>
-
+<summary><strong>Data Pipeline — step outputs and how they flow</strong></summary>
 <br/>
 
-Workers are serialized using `encoding/gob` (binary — faster and smaller than JSON) into `workers.gob`. `CallAPIStep.Body` is stored as `json.RawMessage` (`[]byte`) to avoid gob's limitation with `[]interface{}`.
+Each step that produces data stores it in `pipelineCtx.Steps[stepID]`. Only steps with a non-empty `id` are stored — steps without an `id` still execute, their output is just not accessible later.
 
-Every write follows a **crash-safe atomic pattern**:
+- **webhook** → stores parsed request JSON body
+- **call_api** → stores parsed JSON response body (or `{"raw":"...", "status":N}` for non-JSON)
+- **log** → no output, purely a side effect
 
-```
-encode → CreateTemp → Write → fsync → Rename (atomic)
-```
-
-`os.Rename` is atomic on all platforms. After startup, **all reads come from an in-memory map** — zero disk I/O at runtime.
+`pipelineCtx` is goroutine-local and reset each loop iteration — no data leaks between runs.
 
 </details>
 
 <details>
-<summary><strong>Pipeline Context — Data flows between steps</strong></summary>
-
+<summary><strong>Vars — iterative cross-bucket resolution</strong></summary>
 <br/>
 
-When a webhook step receives a request, it parses the body into a `pipelineCtx`:
+`vars` is `map[string]map[string]string`. Template resolution iterates up to 10 passes, processing all buckets simultaneously:
 
-```go
-type pipelineCtx struct {
-    Body    map[string]interface{}
-    Headers map[string]string
-}
+```
+Pass 1: {{pvt.cf_id}} in glb.api_url resolved → "abc123"
+Pass 2: {{glb.api_url}} in step url resolved → "https://.../abc123/ai/run/..."
 ```
 
-This context is passed to every subsequent step. The template engine replaces `{{.field}}` with values from `pipelineCtx.Body` — supporting dot-notation for nested fields.
-
-Fast path: if a string contains no `{{`, it is returned as-is with zero processing.
+Circular references are safe — the iteration cap prevents infinite loops.
 
 </details>
 
 <details>
-<summary><strong>webhookRouter — Dynamic Dispatch Table</strong></summary>
-
+<summary><strong>webhookRouter — dynamic O(1) dispatch</strong></summary>
 <br/>
 
-`http.ServeMux` panics on duplicate path registration — a problem when workers restart.
+`http.ServeMux` panics on duplicate path registration — a problem when workers restart or update.
 
-The fix: **one `"/"` catch-all** on ServeMux delegates to a custom `webhookRouter` with a mutable `map[path → hookEntry]`. Paths are registered/unregistered freely at runtime via `defer hooks.unregister(fullPath)` — no panics, no stale entries.
+One `"/"` catch-all on ServeMux delegates to `webhookRouter` — a `sync.RWMutex`-protected map that is freely mutable at runtime. Each entry holds a `chan map[string]interface{}` (buffered, size 1). On request arrival, the body is parsed and sent directly through the channel. `defer hooks.unregister(fullPath)` ensures no stale entries.
 
-The channel in `hookEntry` is typed as `chan pipelineCtx` — the parsed webhook payload travels directly to the worker goroutine without any shared memory.
+Path: `/<workerID><path>` — collision-free by design.
 
 </details>
 
 <details>
-<summary><strong>Webhook Path Isolation</strong></summary>
-
+<summary><strong>Storage — crash-safe atomic gob write</strong></summary>
 <br/>
 
-The `path` field in your JSON is a **suffix**, not the final path:
+Serialization via `encoding/gob` (binary — faster and smaller than JSON). `Body` fields stored as `json.RawMessage` to avoid gob's limitation with `[]interface{}`.
 
 ```
-fullPath = "/" + workerID + cfg.Path
+encode → CreateTemp → Write → fsync → Rename (atomic on all platforms)
 ```
 
-Two workers with `"path": "/hook/order"` get completely separate endpoints:
-
-```
-/a1b2c3d4-..../hook/order   ← Worker A
-/e5f6a7b8-..../hook/order   ← Worker B
-```
-
-Guaranteed zero collision.
+After startup, all reads come from in-memory `map[string]*Worker` — zero disk I/O at runtime.
 
 </details>
 
 <details>
-<summary><strong>Worker Modes & Running Flag Sync</strong></summary>
-
+<summary><strong>Running flag sync</strong></summary>
 <br/>
 
-The `running` field in the store is always kept in sync with the actual goroutine state:
+`running` in the store is always kept in sync with the actual goroutine state:
 
-| Event | `running` in store |
-|-------|-------------------|
+| Event | `running` |
+|-------|-----------|
 | `/run` or create with `running: true` | `true` |
-| `once` — workflow completed naturally | `false` (auto-updated) |
-| `/stop` called | `false` (auto-updated) |
-| `loop` — running | always `true` |
+| `once` — completed naturally | `false` (auto) |
+| `/stop` called | `false` (auto) |
+| `loop` — any time | `true` |
 
 `/list` always reflects the real runtime state.
-
-</details>
-
-<details>
-<summary><strong>Concurrency Model</strong></summary>
-
-<br/>
-
-| Component | Primitive | Reason |
-|-----------|-----------|--------|
-| `Store` reads | `sync.RWMutex` RLock | Parallel reads, no contention |
-| `Store` writes | `sync.RWMutex` Lock | Exclusive, safe flush |
-| `Runtime` map | `sync.Mutex` | Prevent concurrent start/stop |
-| `webhookRouter` reads | `sync.RWMutex` RLock | Every HTTP request reads the map |
-| `webhookRouter` writes | `sync.RWMutex` Lock | Register/unregister on worker events |
-| Worker cancellation | `context.WithCancel` | Clean stop without shared state |
-| Webhook payload | `chan pipelineCtx` (buf 1) | Data delivered via channel, no shared memory |
-
-</details>
-
-<details>
-<summary><strong>UUID v4 — Collision-free IDs</strong></summary>
-
-<br/>
-
-IDs are generated using `crypto/rand` (CSPRNG), not `math/rand`:
-
-```go
-var b [16]byte
-rand.Read(b[:])
-b[6] = (b[6] & 0x0f) | 0x40  // version 4
-b[8] = (b[8] & 0x3f) | 0x80  // RFC 4122 variant
-```
-
-Collision probability: **1 in 2¹²²** — negligible for any practical scale.
 
 </details>
 
@@ -324,124 +257,11 @@ Collision probability: **1 in 2¹²²** — negligible for any practical scale.
 | `POST` | `/create` | Create a new worker |
 | `GET` | `/list` | List all workers |
 | `GET` | `/get?id=<id>` | Get a single worker |
-| `PUT` | `/update` | Full-replace a worker |
-| `DELETE` | `/delete?id=<id>` | Delete a worker permanently |
+| `PUT` | `/update` | Full-replace (auto-restart if steps changed) |
+| `DELETE` | `/delete?id=<id>` | Delete permanently |
 | `POST` | `/run?id=<id>` | Start a stopped worker |
 | `POST` | `/stop?id=<id>` | Stop a running worker |
-| `ANY` | `/<id><path>` | Trigger a webhook step |
-
-### Worker Object
-
-```jsonc
-{
-  "id":      "a3f2c1d4-e5b6-4a7f-8c9d-0e1f2a3b4c5d",
-  "name":    "My Worker",
-  "mode":    "loop",       // "once" | "loop"
-  "running": true,
-  "steps":   [...],
-  "created": "2026-03-26T03:47:00Z",
-  "updated": "2026-03-26T03:47:00Z"
-}
-```
-
----
-
-## 🔧 Workflow Examples
-
-### Dynamic AI via Webhook (loop)
-
-```json
-{
-  "name": "AI Chatbot",
-  "mode": "loop",
-  "running": true,
-  "steps": [
-    { "type": "webhook",  "webhook": { "method": "POST", "path": "/ai" } },
-    { "type": "log",      "log":     { "message": "Q: {{.usr}}" } },
-    { "type": "call_api", "call_api": {
-        "method": "POST",
-        "url": "https://api.cloudflare.com/.../ai/run/@cf/meta/llama-3.1-8b-instruct-fast",
-        "headers": { "Authorization": "Bearer TOKEN" },
-        "body": {
-          "messages": [
-            { "role": "system", "content": "{{.sys}}" },
-            { "role": "user",   "content": "{{.usr}}" }
-          ]
-        }
-    }},
-    { "type": "log", "log": { "message": "AI call done" } }
-  ]
-}
-```
-
-Trigger: `curl -X POST http://localhost:8080/<id>/ai -d '{"sys":"max 5 words","usr":"best food?"}'`
-
-### Webhook → Notify Slack
-
-```json
-{
-  "name": "Slack Notifier",
-  "mode": "loop",
-  "running": true,
-  "steps": [
-    { "type": "webhook",  "webhook":  { "method": "POST", "path": "/event" } },
-    { "type": "log",      "log":      { "message": "Notifying Slack: {{.message}}" } },
-    { "type": "call_api", "call_api": {
-        "method": "POST",
-        "url": "https://hooks.slack.com/services/XXX/YYY/ZZZ",
-        "body": { "text": "{{.message}}" }
-    }}
-  ]
-}
-```
-
-### Minimal — Log only (once)
-
-```json
-{
-  "name": "Hello",
-  "mode": "once",
-  "running": true,
-  "steps": [
-    { "type": "log", "log": { "message": "Hello from worker!" } }
-  ]
-}
-```
-
----
-
-## 🖥️ curl Cheatsheet
-
-```bash
-ID="paste-your-uuid-here"
-
-# Create (once)
-curl -X POST http://localhost:8080/create \
-  -H "Content-Type: application/json" \
-  -d '{"name":"test","mode":"once","running":true,"steps":[...]}'
-
-# Create (loop) — CLI friendly single line
-curl -X POST http://localhost:8080/create -H "Content-Type: application/json" -d '{"name":"test","mode":"loop","running":true,"steps":[...]}'
-
-# Trigger webhook with pipeline data
-curl -X POST http://localhost:8080/$ID/hook/order \
-  -H "Content-Type: application/json" \
-  -d '{"sys":"be brief","usr":"what is pizza?"}'
-
-# List / Get
-curl -s http://localhost:8080/list | jq
-curl -s "http://localhost:8080/get?id=$ID" | jq
-
-# Update
-curl -X PUT http://localhost:8080/update \
-  -H "Content-Type: application/json" \
-  -d '{"id":"'$ID'","name":"updated","mode":"loop","running":true,"steps":[...]}'
-
-# Run / Stop / Delete
-curl -X POST   "http://localhost:8080/run?id=$ID"
-curl -X POST   "http://localhost:8080/stop?id=$ID"
-curl -X DELETE "http://localhost:8080/delete?id=$ID"
-```
+| `ANY` | `/<workerID><path>` | Trigger a webhook step |
 
 ---
 
@@ -451,20 +271,15 @@ curl -X DELETE "http://localhost:8080/delete?id=$ID"
 POST /create
       │
       ▼
-  [ STORED ]  ── running: false
+  [ STORED ]  running: false
       │
-      │  POST /run  (or create with running: true)
+      │ running:true / POST /run
       ▼
-  [ RUNNING ] ── goroutine active, webhook registered
+  [ RUNNING ]
       │
-      ├──── POST /stop ──────────────► [ STOPPED ] running: false
-      │                                     │
-      │                               POST /run
-      │                                     │
-      ├──── mode=once, done ────────► [ IDLE ] running: false
-      │                               POST /run to restart
-      │
-      └──── mode=loop, done ────────► auto restart → [ RUNNING ]
+      ├── POST /stop ────────────► running: false
+      ├── mode=once, done ───────► running: false  →  POST /run to restart
+      └── mode=loop, done ───────► auto restart, running stays true
 ```
 
 ---
@@ -472,19 +287,11 @@ POST /create
 ## 🏗️ Build
 
 ```bash
-# Run directly
 go run main.go
-
-# Build binary
 go build -o worker-engine main.go
+go build -ldflags="-s -w" -o worker-engine main.go   # optimized
 
-# Build optimized (smaller binary)
-go build -ldflags="-s -w" -o worker-engine main.go
-```
-
-### Cross-compile
-
-```bash
+# Cross-compile
 GOOS=windows GOARCH=amd64 go build -o worker-engine.exe main.go
 GOOS=linux   GOARCH=amd64 go build -o worker-engine main.go
 GOOS=darwin  GOARCH=arm64 go build -o worker-engine main.go
@@ -496,9 +303,10 @@ GOOS=darwin  GOARCH=arm64 go build -o worker-engine main.go
 
 ```
 .
-├── main.go            # Entire application — single file
-├── workers.gob        # Persistent store (auto-created on first run)
-├── DOCUMENTATION.md   # In-depth technical documentation
+├── main.go      # entire application — single file, zero dependencies
+├── workers.gob  # persistent store (auto-created on first run)
+├── doc.md       # in-depth technical documentation
+├── curl.md      # curl examples for all endpoints
 └── README.md
 ```
 
@@ -506,12 +314,13 @@ GOOS=darwin  GOARCH=arm64 go build -o worker-engine main.go
 
 ## ⚠️ Limitations
 
-- **Webhook waits for 1 request per step.** Use `mode: "loop"` for a permanent listener.
-- **Templates read webhook body only.** `call_api` response is not yet in the pipeline.
-- **No authentication** on API endpoints — add middleware before exposing to the internet.
-- **Single process** — not designed for multi-instance or distributed deployment.
-- **`call_api` body is JSON only** — `form-urlencoded` and `multipart` are not supported.
-- **Storage is a flat file** — for very high write frequency, consider SQLite or BoltDB.
+- **Webhook waits for 1 request per step.** `mode: "loop"` handles this automatically.
+- **`{{.field}}` does not exist.** All references must be explicit.
+- **`call_api` body is JSON only.** `form-urlencoded` / `multipart` not supported.
+- **Vars are static.** Cannot change while worker is running.
+- **Pipeline data is not persistent.** Lost when worker completes or restarts.
+- **No authentication** on API endpoints.
+- **Single process** — not designed for distributed deployment.
 
 ---
 
@@ -525,6 +334,6 @@ MIT License — free to use, modify, and distribute.
 
 <div align="center">
 
-Built with pure Go · No dependencies · Cross-platform
+Built with pure Go · Zero dependencies · Windows / Linux / macOS
 
 </div>

@@ -73,13 +73,14 @@ const (
 )
 
 type Worker struct {
-	ID      string     `json:"id"`
-	Name    string     `json:"name"`
-	Mode    WorkerMode `json:"mode"` // "once" | "loop"
-	Steps   []Step     `json:"steps"`
-	Running bool       `json:"running"`
-	Created time.Time  `json:"created"`
-	Updated time.Time  `json:"updated"`
+	ID      string                       `json:"id"`
+	Name    string                       `json:"name"`
+	Mode    WorkerMode                   `json:"mode"`           // "once" | "loop"
+	Vars    map[string]map[string]string `json:"vars,omitempty"` // {{wadah.key}}
+	Steps   []Step                       `json:"steps"`
+	Running bool                         `json:"running"`
+	Created time.Time                    `json:"created"`
+	Updated time.Time                    `json:"updated"`
 }
 
 // ─────────────────────────────────────────────
@@ -106,6 +107,23 @@ func openStore() (*Store, error) {
 	if err := gob.NewDecoder(f).Decode(&s.data); err != nil && err != io.EOF {
 		log.Printf("warn: store decode failed (%v), starting fresh", err)
 		s.data = make(map[string]*Worker)
+	}
+	// schema migration: detect workers saved with old step format (Value == nil)
+	// and drop them — they cannot be recovered without the old field definitions.
+	stale := []string{}
+	for id, w := range s.data {
+		for _, step := range w.Steps {
+			if step.Value == nil {
+				stale = append(stale, id)
+				break
+			}
+		}
+	}
+	if len(stale) > 0 {
+		for _, id := range stale {
+			log.Printf("migrate: dropping worker %s — old step schema (re-create it)", id)
+			delete(s.data, id)
+		}
 	}
 	return s, nil
 }
@@ -181,17 +199,33 @@ func (s *Store) List() []*Worker {
 //    This map is mutable at runtime: register/unregister freely.
 // ─────────────────────────────────────────────
 
-// pipelineCtx carries data produced by one step for consumption by later steps.
-// Currently populated by the webhook step with the incoming request body.
+// pipelineCtx carries data flowing through a workflow.
+// Every step that produces output stores it here keyed by step ID.
+//
+//	Webhook step  → stores parsed request body
+//	CallAPI step  → stores parsed response body (if JSON) or raw string
+//
+// Access via {{stepId.field}} or {{stepId.nested.field}}
 type pipelineCtx struct {
-	Body    map[string]interface{} // parsed JSON body from webhook
-	Headers map[string]string      // incoming request headers
+	Steps map[string]map[string]interface{} // stepID → output data
+}
+
+func newPipelineCtx() pipelineCtx {
+	return pipelineCtx{Steps: make(map[string]map[string]interface{})}
+}
+
+// store saves output data for a step by its ID (no-op if ID is empty).
+func (p *pipelineCtx) store(stepID string, data map[string]interface{}) {
+	if stepID == "" {
+		return
+	}
+	p.Steps[stepID] = data
 }
 
 type hookEntry struct {
 	method   string
 	workerID string
-	arrived  chan pipelineCtx // delivers parsed webhook payload to the worker goroutine
+	arrived  chan map[string]interface{} // delivers parsed request body to worker goroutine
 }
 
 type webhookRouter struct {
@@ -203,7 +237,7 @@ func newWebhookRouter() *webhookRouter {
 	return &webhookRouter{entries: make(map[string]*hookEntry)}
 }
 
-func (wr *webhookRouter) register(path, method, workerID string, arrived chan pipelineCtx) {
+func (wr *webhookRouter) register(path, method, workerID string, arrived chan map[string]interface{}) {
 	wr.mu.Lock()
 	defer wr.mu.Unlock()
 	wr.entries[path] = &hookEntry{method: method, workerID: workerID, arrived: arrived}
@@ -236,21 +270,15 @@ func (wr *webhookRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[worker:%s] WEBHOOK %s %s | body: %s",
 		entry.workerID, r.Method, r.URL.Path, string(body))
 
-	// parse body into pipeline context
-	pctx := pipelineCtx{
-		Body:    make(map[string]interface{}),
-		Headers: make(map[string]string),
-	}
-	_ = json.Unmarshal(body, &pctx.Body)
-	for k := range r.Header {
-		pctx.Headers[k] = r.Header.Get(k)
-	}
+	// parse body as generic JSON map
+	bodyMap := make(map[string]interface{})
+	_ = json.Unmarshal(body, &bodyMap)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, `{"status":"received"}`)
 	select {
-	case entry.arrived <- pctx:
+	case entry.arrived <- bodyMap:
 	default:
 	}
 }
@@ -300,6 +328,20 @@ func (rt *Runtime) Start(w *Worker, store *Store, hooks *webhookRouter) {
 			}
 			if mode == ModeLoop {
 				log.Printf("[worker:%s] mode=loop, restarting...", w.ID)
+				// ctx-aware sleep: prevents CPU spin when no step blocks (e.g. all nil values)
+				select {
+				case <-ctx.Done():
+					if wk, ok := store.Get(w.ID); ok {
+						wk.Running = false
+						wk.Updated = time.Now()
+						_ = store.Save(wk)
+					}
+					rt.mu.Lock()
+					delete(rt.cancels, w.ID)
+					rt.mu.Unlock()
+					return
+				case <-time.After(50 * time.Millisecond):
+				}
 				continue
 			}
 			// once: completed naturally — update Running=false in store
@@ -334,7 +376,12 @@ func (rt *Runtime) IsRunning(id string) bool {
 
 func runWorker(ctx context.Context, w *Worker, _ *Store, hooks *webhookRouter) {
 	log.Printf("[worker:%s] started — %s", w.ID, w.Name)
-	pctx := pipelineCtx{Body: make(map[string]interface{}), Headers: make(map[string]string)}
+	pctx := newPipelineCtx()
+	vars := w.Vars
+	if vars == nil {
+		vars = map[string]map[string]string{}
+	}
+
 	for _, step := range w.Steps {
 		select {
 		case <-ctx.Done():
@@ -348,12 +395,17 @@ func runWorker(ctx context.Context, w *Worker, _ *Store, hooks *webhookRouter) {
 		}
 		switch step.Type {
 		case "webhook":
-			pctx = execWebhook(ctx, w.ID, step, hooks)
+			out := execWebhook(ctx, w.ID, step, hooks)
+			pctx.store(step.ID, out)
+
 		case "log":
-			msg := renderTemplate(step.Value.Message, pctx)
+			msg := renderTemplate(step.Value.Message, pctx, vars)
 			log.Printf("[worker:%s][step:%s] LOG → %s", w.ID, step.stepLabel(), msg)
+
 		case "call_api":
-			execCallAPI(ctx, w.ID, step, pctx)
+			out := execCallAPI(ctx, w.ID, step, pctx, vars)
+			pctx.store(step.ID, out)
+
 		default:
 			log.Printf("[worker:%s][step:%s] unknown type: %q", w.ID, step.stepLabel(), step.Type)
 		}
@@ -375,28 +427,86 @@ func (s Step) stepLabel() string {
 
 // ─────────────────────────────────────────────
 //  Template rendering
-//  Syntax: {{.field}}       → top-level field from webhook body
-//          {{.field.sub}}   → nested field
-//  Unknown keys render as empty string (silent).
+//
+//  Dua namespace yang tersedia:
+//
+//    {{wadah.key}}        → vars["wadah"]["key"]   (static config)
+//    {{stepId.field}}     → output step by ID       (runtime data)
+//    {{stepId.a.b}}       → nested field via dot-notation
+//
+//  Vars antar-wadah bisa saling merujuk (iteratif, max 10x).
+//  Unknown keys → empty string (silent).
 // ─────────────────────────────────────────────
 
-func renderTemplate(s string, pctx pipelineCtx) string {
+func renderTemplate(s string, pctx pipelineCtx, vars map[string]map[string]string) string {
 	if !strings.Contains(s, "{{") {
-		return s // fast path — nothing to replace
+		return s // fast path
 	}
+
+	// ── pass 1: resolve {{wadah.key}} dari vars (iteratif, antar-wadah bebas) ──
+	for i := 0; i < 10; i++ {
+		prev := s
+		s = resolveAllVars(s, vars)
+		if s == prev {
+			break
+		}
+	}
+
+	// ── pass 2: resolve {{stepId.field}} dari pctx.Steps ───────────────────
+	for strings.Contains(s, "{{") {
+		start := strings.Index(s, "{{")
+		end := strings.Index(s[start:], "}}")
+		if end == -1 {
+			break
+		}
+		end += start
+		placeholder := s[start : end+2]
+		inner := strings.TrimSpace(s[start+2 : end])
+
+		dotIdx := strings.Index(inner, ".")
+		if dotIdx == -1 {
+			// tidak ada titik — tidak dikenal, hapus
+			s = strings.Replace(s, placeholder, "", 1)
+			continue
+		}
+		stepID := inner[:dotIdx]
+		fieldKey := inner[dotIdx+1:]
+		val := ""
+		if stepData, ok := pctx.Steps[stepID]; ok {
+			val = fmt.Sprintf("%v", resolveKey(fieldKey, stepData))
+		}
+		s = strings.Replace(s, placeholder, val, 1)
+	}
+	return s
+}
+
+// resolveAllVars melakukan satu pass penggantian semua {{wadah.key}} dari vars.
+func resolveAllVars(s string, vars map[string]map[string]string) string {
 	result := s
-	for strings.Contains(result, "{{.") {
-		start := strings.Index(result, "{{.")
+	for strings.Contains(result, "{{") {
+		start := strings.Index(result, "{{")
 		end := strings.Index(result[start:], "}}")
 		if end == -1 {
 			break
 		}
 		end += start
-		placeholder := result[start : end+2]            // e.g. "{{.sys}}"
-		key := strings.TrimSpace(result[start+3 : end]) // e.g. "sys"
+		placeholder := result[start : end+2]
+		inner := strings.TrimSpace(result[start+2 : end])
 
-		value := resolveKey(key, pctx.Body)
-		result = strings.Replace(result, placeholder, fmt.Sprintf("%v", value), 1)
+		// hanya proses jika format "wadah.key" dan wadah ada di vars
+		dotIdx := strings.Index(inner, ".")
+		if dotIdx == -1 || strings.HasPrefix(inner, ".") {
+			// bukan format vars — skip, biarkan pass berikutnya tangani
+			break
+		}
+		wadah := inner[:dotIdx]
+		key := inner[dotIdx+1:]
+		bucket, ok := vars[wadah]
+		if !ok {
+			// wadah tidak ada — bukan var reference, stop agar tidak infinite loop
+			break
+		}
+		result = strings.Replace(result, placeholder, bucket[key], 1)
 	}
 	return result
 }
@@ -418,54 +528,61 @@ func resolveKey(key string, data map[string]interface{}) interface{} {
 	return ""
 }
 
-func execWebhook(ctx context.Context, workerID string, step Step, hooks *webhookRouter) pipelineCtx {
+func execWebhook(ctx context.Context, workerID string, step Step, hooks *webhookRouter) map[string]interface{} {
 	cfg := step.Value
-	// Full path: /<workerID><path>
 	fullPath := "/" + workerID + cfg.Path
 
-	arrived := make(chan pipelineCtx, 1)
+	arrived := make(chan map[string]interface{}, 1)
 	hooks.register(fullPath, string(cfg.Method), workerID, arrived)
 	defer hooks.unregister(fullPath)
 
 	select {
-	case pctx := <-arrived:
-		log.Printf("[worker:%s][step:%s] WEBHOOK triggered, continuing workflow", workerID, step.stepLabel())
-		return pctx
+	case bodyMap := <-arrived:
+		log.Printf("[worker:%s][step:%s] WEBHOOK triggered", workerID, step.stepLabel())
+		return bodyMap
 	case <-ctx.Done():
 		log.Printf("[worker:%s][step:%s] WEBHOOK cancelled", workerID, step.stepLabel())
-		return pipelineCtx{Body: make(map[string]interface{}), Headers: make(map[string]string)}
+		return map[string]interface{}{}
 	}
 }
 
-func execCallAPI(ctx context.Context, workerID string, step Step, pctx pipelineCtx) {
+func execCallAPI(ctx context.Context, workerID string, step Step, pctx pipelineCtx, vars map[string]map[string]string) map[string]interface{} {
 	cfg := step.Value
-	renderedURL := renderTemplate(cfg.URL, pctx)
+	renderedURL := renderTemplate(cfg.URL, pctx, vars)
 
 	var reqBody io.Reader
 	if len(cfg.Body) > 0 {
-		renderedBody := renderTemplate(string(cfg.Body), pctx)
+		renderedBody := renderTemplate(string(cfg.Body), pctx, vars)
 		reqBody = bytes.NewReader([]byte(renderedBody))
 	}
 	req, err := http.NewRequestWithContext(ctx, string(cfg.Method), renderedURL, reqBody)
 	if err != nil {
 		log.Printf("[worker:%s][step:%s] CALL_API build error: %v", workerID, step.stepLabel(), err)
-		return
+		return map[string]interface{}{}
 	}
 	if len(cfg.Body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	for k, v := range cfg.Headers {
-		req.Header.Set(k, renderTemplate(v, pctx))
+		req.Header.Set(k, renderTemplate(v, pctx, vars))
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Printf("[worker:%s][step:%s] CALL_API error: %v", workerID, step.stepLabel(), err)
-		return
+		return map[string]interface{}{}
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respRaw, _ := io.ReadAll(resp.Body)
 	log.Printf("[worker:%s][step:%s] CALL_API %s %s → HTTP %d | %s",
-		workerID, step.stepLabel(), cfg.Method, cfg.URL, resp.StatusCode, string(respBody))
+		workerID, step.stepLabel(), cfg.Method, cfg.URL, resp.StatusCode, string(respRaw))
+
+	// parse response: JSON → map, fallback → {"raw": "<string>"}
+	out := make(map[string]interface{})
+	if err := json.Unmarshal(respRaw, &out); err != nil {
+		out["raw"] = string(respRaw)
+		out["status"] = resp.StatusCode
+	}
+	return out
 }
 
 // ─────────────────────────────────────────────

@@ -1,3 +1,0 @@
-curl -X POST http://localhost:8080/46fc06ab-e61b-40b7-b933-a815f99c2d8a/hook/hello \
-  -H "Content-Type: application/json" \
-  -d '{"hello": "world"}'

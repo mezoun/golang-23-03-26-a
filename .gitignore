@@ -9,3 +9,4 @@ a/node_modules/
 doc-*.md
 README-*.md
 .notes*
+.curl-*.md

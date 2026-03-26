@@ -1,0 +1,201 @@
+bantu aku memperbaiki dokumen pengembangan ai agents ini :
+```
+Curl CREATE WORKER AI Agents
+
+curl -X POST http://localhost:8080/create \
+  -H "Content-Type: application/json" \
+  -d '{
+  "name": "Agentic AI: Resep Masakan",
+  "mode": "loop",
+  "running": true,
+  "vars": {
+    "glb": {
+      "ai_model": "@cf/meta/llama-3.1-8b-instruct-fast",
+      "api_url": "https://api.cloudflare.com/client/v4/accounts/{{pvt.cf_id}}/ai/run/{{glb.ai_model}}"
+    },
+    "pvt": {
+      "cf_id": "GANTI_CF_ACCOUNT_ID",
+      "cf_auth": "GANTI_CF_API_TOKEN"
+    }
+  },
+  "steps": [
+    {
+      "id": "input",
+      "name": "Terima Input Pengguna",
+      "type": "webhook",
+      "value": { "method": "POST", "path": "/masakan" }
+    },
+    {
+      "id": "detect_type",
+      "name": "Deteksi Tipe Input",
+      "type": "branch",
+      "value": {
+        "cases": [
+          { "when": { "left": "{{input.type}}", "op": "==", "right": "deskripsi" }, "goto": "agent_deskripsi" },
+          { "when": { "left": "{{input.type}}", "op": "==", "right": "judul"     }, "goto": "agent_judul"     },
+          { "when": { "left": "{{input.type}}", "op": "==", "right": "bahan"     }, "goto": "agent_bahan"     },
+          { "goto": "log_undefined" }
+        ]
+      }
+    },
+    {
+      "id": "agent_deskripsi",
+      "name": "Agent AI — dari Deskripsi",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{glb.api_url}}",
+        "headers": { "Authorization": "Bearer {{pvt.cf_auth}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "Kamu adalah chef AI. Pengguna memberi DESKRIPSI masakan. Buat resep lengkap. WAJIB jawab HANYA JSON valid tanpa teks tambahan. Format: {\"judul\":\"...\",\"deskripsi\":\"...\",\"bahan\":\"...\",\"cara_masak\":\"...\",\"saran_penyajian\":\"...\"}"
+            },
+            { "role": "user", "content": "Buat resep dari deskripsi: {{json:input.data}}" }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000 }
+      },
+      "output": { "agent_raw": "{{agent_deskripsi.result.response}}" },
+      "next": "parse_result"
+    },
+    {
+      "id": "agent_judul",
+      "name": "Agent AI — dari Judul",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{glb.api_url}}",
+        "headers": { "Authorization": "Bearer {{pvt.cf_auth}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "Kamu adalah chef AI. Pengguna memberi NAMA masakan. Buat resep lengkap. WAJIB jawab HANYA JSON valid tanpa teks tambahan. Format: {\"judul\":\"...\",\"deskripsi\":\"...\",\"bahan\":\"...\",\"cara_masak\":\"...\",\"saran_penyajian\":\"...\"}"
+            },
+            { "role": "user", "content": "Buat resep untuk masakan: {{json:input.data}}" }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000 }
+      },
+      "output": { "agent_raw": "{{agent_judul.result.response}}" },
+      "next": "parse_result"
+    },
+    {
+      "id": "agent_bahan",
+      "name": "Agent AI — dari Bahan",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{glb.api_url}}",
+        "headers": { "Authorization": "Bearer {{pvt.cf_auth}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "Kamu adalah chef AI. Pengguna memberi daftar BAHAN. Rekomendasikan dan buat resep terbaik. WAJIB jawab HANYA JSON valid tanpa teks tambahan. Format: {\"judul\":\"...\",\"deskripsi\":\"...\",\"bahan\":\"...\",\"cara_masak\":\"...\",\"saran_penyajian\":\"...\"}"
+            },
+            { "role": "user", "content": "Bahan yang saya punya: {{json:input.data}}. Buat resep dari bahan ini." }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000 }
+      },
+      "output": { "agent_raw": "{{agent_bahan.result.response}}" },
+      "next": "parse_result"
+    },
+    {
+      "id": "log_undefined",
+      "name": "Tipe Tidak Dikenal",
+      "type": "log",
+      "value": {
+        "message": "[UNDEFINED] Tipe: \"{{input.type}}\" | data: \"{{input.data}}\" | Gunakan: deskripsi / judul / bahan"
+      },
+      "next": "end"
+    },
+    {
+      "id": "parse_result",
+      "name": "Agent AI — Validator JSON",
+      "type": "call_api",
+      "value": {
+        "method": "POST",
+        "url": "{{glb.api_url}}",
+        "headers": { "Authorization": "Bearer {{pvt.cf_auth}}" },
+        "body": {
+          "messages": [
+            {
+              "role": "system",
+              "content": "Kamu adalah JSON validator. Input adalah teks yang seharusnya berisi JSON resep. Pastikan output JSON valid dengan tepat 5 field: judul, deskripsi, bahan, cara_masak, saran_penyajian. Jika field hilang tambahkan. Buang semua teks di luar JSON. WAJIB jawab HANYA JSON murni TANPA markdown TANPA backtick."
+            },
+            {
+              "role": "user",
+              "content": "Validasi JSON ini: {{agent_deskripsi.agent_raw}}{{agent_judul.agent_raw}}{{agent_bahan.agent_raw}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000 }
+      },
+      "output": { "final": "{{parse_result.result.response}}" },
+      "next": "log_result"
+    },
+    {
+      "id": "log_result",
+      "name": "Output Akhir",
+      "type": "log",
+      "value": {
+        "message": "[RESEP] type={{input.type}} | input={{input.data}} | result={{parse_result.final}}"
+      },
+      "next": "end"
+    },
+    {
+      "id": "end",
+      "name": "Selesai",
+      "type": "log",
+      "value": { "message": "[END] Menunggu input berikutnya..." }
+    }
+  ]
+}'
+
+---
+
+TRIGGER WEBHOOK Test
+
+Input Deskripsi
+curl -X POST http://localhost:8080/masakan \
+  -H "Content-Type: application/json" \
+  -d '{
+  "input": "Masakan pedas yang berasal dari kota padang dengan dan akan mantap jika disajikan dengan nasi putih, selain rendang."
+}'
+
+Input Judul
+curl -X POST http://localhost:8080/masakan \
+  -H "Content-Type: application/json" \
+  -d '{
+  "input": "Rendang Ayam Asam Manis"
+}'
+
+Input Bahan
+curl -X POST http://localhost:8080/masakan \
+  -H "Content-Type: application/json" \
+  -d '{
+  "input": "Kentang, kambing, kunyit, cabai."
+}'
+
+Input Campuran
+curl -X POST http://localhost:8080/masakan \
+  -H "Content-Type: application/json" \
+  -d '{
+  "input": "Masakan khas jawa yang enak dimakan saat malam hari dan terbuat dari bahan alami seperti kentang dan sayuran serta lainya, lalu dimasak dengan cara dioseng."
+}'
+
+Input Undefined (hal diluar koteks makanan dan tidak termasuk dari salah satu : Deskripsi, Judul, Bahan, Campuran)
+curl -X POST http://localhost:8080/masakan \
+  -H "Content-Type: application/json" \
+  -d '{
+  "input": "Masakan khas jawa yang enak dimakan saat malam hari dan terbuat dari bahan alami seperti kentang dan sayuran serta lainya, lalu dimasak dengan cara dioseng."
+}'
+```
+
+supaya ai agents bekerja maksimal dan optimal serta dengan akurasi yang profesional dan bestpractice, perbaiki alur worker nya dan beri aku curl untuk test nya.
+
+ai agents harus melalui banyak tahapan call api llm, dan tahapan yang banyak itu akan menghasilkan kualitas hasil akhir yang sangat bagus.

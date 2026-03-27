@@ -33,6 +33,13 @@ implementasi `rancangan_membuat_agent.md` di atas engine `main.go`.
 Server main.go berjalan di: http://localhost:8080
 ```
 
+Server otomatis membuat dua folder saat pertama kali dibutuhkan:
+
+| Folder | Isi |
+|--------|-----|
+| `log/` | File log per-worker: `log/recipe-agent-v1.log` |
+| `output/` | File hasil agent: `output/agent-recipe_*.json` |
+
 ---
 
 ## 1. 🚀 CREATE WORKER
@@ -684,7 +691,35 @@ curl -s -X PUT http://localhost:8080/update \
 
 ---
 
-## 14. 🗑️ DELETE WORKER
+## 14. 📋 CEK LOG WORKER
+
+Log setiap worker disimpan ke file terpisah — tidak hanya ke stdout terminal.  
+Path: `log/recipe-agent-v1.log`  
+Format: `{ISO-8601 timestamp} {pesan}`
+
+```bash
+# Ikuti log secara real-time (paling berguna saat debugging)
+tail -f log/recipe-agent-v1.log
+
+# Tampilkan 50 baris terakhir
+tail -50 log/recipe-agent-v1.log
+
+# Cari semua error atau panic
+grep -i "PANIC\|_error\|ERROR\|failed" log/recipe-agent-v1.log
+
+# Filter hanya log step tertentu (misal step s12_critics)
+grep "s12_critics" log/recipe-agent-v1.log
+
+# Hitung berapa kali workflow selesai
+grep -c "workflow completed" log/recipe-agent-v1.log
+```
+
+> **Catatan:** Tidak ada HTTP endpoint untuk membaca log — akses hanya via filesystem secara langsung.  
+> Log file di-buffer 32 KB dan di-flush setiap 3 detik, jadi ada sedikit delay dari waktu eksekusi ke waktu log muncul di file.
+
+---
+
+## 16. 🗑️ DELETE WORKER
 
 ```bash
 curl -s -X DELETE "http://localhost:8080/delete?id=recipe-agent-v1" | jq .
@@ -697,9 +732,15 @@ curl -s -X DELETE "http://localhost:8080/delete?id=recipe-agent-v1" | jq .
 
 ---
 
-## 🔍 Trace Alur Pipeline (untuk debug via log)
+## 🔍 Trace Alur Pipeline (debug via log file)
 
-Setelah mengirim webhook, pantau log server. Urutan yang benar:
+Setelah mengirim webhook, ikuti file log worker untuk melihat urutan eksekusi:
+
+```bash
+tail -f log/recipe-agent-v1.log
+```
+
+Urutan log yang benar (isi file `log/recipe-agent-v1.log`):
 
 ```
 [worker:recipe-agent-v1][step:01 – Receive Input(s01_webhook)]         WEBHOOK triggered

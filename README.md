@@ -15,11 +15,11 @@
 <br/>
 
 Define workflows in JSON. Run them as isolated workers.  
-**Webhook → Branch → Call API → Log** — with full pipeline, vars, retry, sleep, and zero `go get`.
+**Webhook → Branch → Call API → Log** — with full pipeline, vars, retry, sleep, file manager, and zero `go get`.
 
 <br/>
 
-[**Quick Start**](#-quick-start) · [**Pipeline**](#-pipeline--data-flow) · [**Step Types**](#-step-types) · [**Vars**](#-vars-system) · [**API**](#-api-reference) · [**Docs**](doc.md) · [**curl Guide**](curl.md)
+[**Quick Start**](#-quick-start) · [**Pipeline**](#-pipeline--data-flow) · [**Step Types**](#-step-types) · [**Vars**](#-vars-system) · [**File Manager**](#-file-manager) · [**API**](#-api-reference) · [**Docs**](doc.md) · [**curl Guide**](curl.md)
 
 </div>
 
@@ -31,8 +31,8 @@ Define workflows in JSON. Run them as isolated workers.
 |-|---------|-------------|
 | 🪝 | **Webhook** | Accept `GET`/`POST` — body, query params, and headers flow into pipeline |
 | 🌐 | **Call API** | Hit external URLs — response flows into pipeline; built-in retry & backoff |
-| 🖨️ | **Log** | Print messages to stdout with `{{stepId.field}}` templates |
-| 🔀 | **Branch** | Conditional routing — `==` `!=` `>` `<` `contains` `starts_with` `ends_with` |
+| 🖨️ | **Log** | Print messages to per-worker log file with `{{stepId.field}}` templates |
+| 🔀 | **Branch** | Conditional routing — `==` `!=` `>` `<` `>=` `<=` `contains` `starts_with` `ends_with` |
 | ⏱️ | **Sleep** | Explicit delay up to 60s — cancellable, for rate limiting and backoff |
 | 📝 | **Set Var** | Store computed values inline — no API call needed for data transforms |
 | 🔄 | **Data Pipeline** | Every step output stored by ID, accessible via `{{stepId.field}}` |
@@ -43,6 +43,8 @@ Define workflows in JSON. Run them as isolated workers.
 | 🛡️ | **Isolated** | Each worker in its own goroutine — panic in one never affects others |
 | 📊 | **Status API** | `GET /status` — runtime info, run count, last error, without reading logs |
 | 🚦 | **Multi-tenant** | Hard limits: 50 concurrent · 500 stored · 100 steps · 20 API calls |
+| 📁 | **File Manager** | Upload, list, view, delete, and agent-save files via `/files/*` endpoints |
+| 📋 | **Per-Worker Logs** | Buffered log file per worker at `log/{workerID}.log` — 32 KB buffer, flush every 3s |
 
 ---
 
@@ -92,6 +94,8 @@ curl -X POST http://localhost:8080/<workerID>/ask \
 [worker:...] LOG → Answer: Pizza!
 [worker:...] workflow completed
 ```
+
+> Semua log tersimpan di `log/<workerID>.log` — file per worker, tidak hanya stdout.
 
 ---
 
@@ -149,7 +153,7 @@ Every webhook step automatically exposes:
 ```
 
 Blocks until a request arrives. Path is scoped to worker: `/<workerID>/trigger`.  
-Returns HTTP 429 `{"error":"worker busy"}` if the worker is still processing the previous request.
+Returns HTTP 429 `{"error":"worker busy, retry later"}` if the worker is still processing the previous request.
 
 ---
 
@@ -177,15 +181,18 @@ Returns HTTP 429 `{"error":"worker busy"}` if the worker is still processing the
 | `delay_ms` | int | Initial delay between retries in ms |
 | `backoff` | bool | Exponential backoff if true |
 
-Retries on: network error, HTTP 429, HTTP 5xx. On exhaustion, output contains `_error` and `_attempts`.
+Retries on: network error, HTTP 429, HTTP 5xx. On exhaustion, output contains `_error` and `_attempts`.  
+`_status` (HTTP status code) is always present in the output.
 
 ---
 
-### `log` — Print to stdout
+### `log` — Write to per-worker log file
 
 ```json
 { "type": "log", "value": { "message": "User: {{hook.user}} | Score: {{score.value}}" } }
 ```
+
+Output is written to `log/<workerID>.log` with ISO-8601 timestamp prefix.
 
 ---
 
@@ -253,7 +260,7 @@ Any step can have a `next` field to unconditionally jump to another step after e
 { "id": "agent_a", "type": "call_api", "value": { ... }, "next": "merge_results" }
 ```
 
-If `branch` already jumped, `next` is ignored.
+If `branch` already jumped, `next` is ignored. Jump limit: 1000 per run (protects against infinite loops).
 
 ---
 
@@ -282,25 +289,120 @@ Vars are read fresh from store on each loop iteration, so updating vars via `/up
 
 ---
 
+## 📁 File Manager
+
+Worker Engine menyediakan file manager sederhana berbasis HTTP untuk menyimpan, mengelola, dan mengakses file output dari worker/agent. Semua file disimpan di folder `output/`.
+
+### `POST /files/upload` — Upload file
+
+Upload file via `multipart/form-data`, field name `file`. Maksimum 10 MB per file.
+
+```bash
+curl -X POST http://localhost:8080/files/upload \
+     -F "file=@/path/to/yourfile.txt"
+```
+
+**Response (HTTP 201):**
+```json
+{ "name": "yourfile.txt", "size_bytes": 1234, "path": "output/yourfile.txt" }
+```
+
+---
+
+### `GET /files/list` — List semua file
+
+```bash
+curl http://localhost:8080/files/list
+```
+
+**Response:**
+```json
+[
+  { "name": "report.json", "size_bytes": 2048, "modified": "2026-03-26T14:30:00Z" },
+  { "name": "agent-recipe_20260326-143022_a1b2c3d4.json", "size_bytes": 3821, "modified": "2026-03-26T14:30:22Z" }
+]
+```
+
+---
+
+### `GET /files/view?name=<filename>` — Download / tampilkan file
+
+```bash
+# Download otomatis (nama file sesuai server)
+curl -O -J "http://localhost:8080/files/view?name=report.json"
+
+# Tampilkan ke stdout
+curl "http://localhost:8080/files/view?name=report.json"
+```
+
+---
+
+### `DELETE /files/delete?name=<filename>` — Hapus file
+
+```bash
+curl -X DELETE "http://localhost:8080/files/delete?name=report.json"
+```
+
+**Response:**
+```json
+{ "deleted": "report.json" }
+```
+
+---
+
+### `POST /files/save` — Simpan output agent
+
+Endpoint ini dirancang untuk dipanggil dari dalam pipeline worker via step `call_api`. Nama file di-generate otomatis dengan format `agent-{tag}_{YYYYMMDD-HHMMSS}_{rand8hex}.json`.
+
+```bash
+curl -X POST http://localhost:8080/files/save \
+     -H "Content-Type: application/json" \
+     -d '{"tag": "recipe", "content": "{\"title\":\"Rendang\"}"}'
+```
+
+**Response (HTTP 201):**
+```json
+{
+  "name": "agent-recipe_20260326-143022_a1b2c3d4.json",
+  "size_bytes": 25,
+  "view_url": "/files/view?name=agent-recipe_20260326-143022_a1b2c3d4.json"
+}
+```
+
+| Field | Keterangan |
+|-------|-----------|
+| `tag` | Label opsional — muncul di nama file; hanya huruf, angka, dash (maks 32 karakter) |
+| `content` | Isi file — wajib, tidak boleh kosong (maks 5 MB) |
+
+> `tag` kosong menghasilkan nama: `agent_{YYYYMMDD-HHMMSS}_{rand8hex}.json`
+
+---
+
 ## 📐 Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    HTTP Server :8080                     │
-│  ServeMux                                                │
-│  ├─ /create /list /get /status /update /delete /run /stop│
-│  └─ /  ──────────────► webhookRouter  O(1) map lookup    │
-│                          → HTTP 429 if worker busy       │
-├──────────────────────────────────────────────────────────┤
-│  Runtime  (goroutine per worker, recover() per goroutine)│
-│  Global semaphore: max 20 concurrent call_api            │
-│  pipelineCtx: goroutine-local, reset each loop           │
-│  Vars snapshot: refreshed each iteration (live update)   │
-├──────────────────────────────────────────────────────────┤
-│  Store                                                   │
-│  in-memory map + snapshot copy + gob atomic write        │
-│  flush lock released before encode — no contention       │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                    HTTP Server :8080                         │
+│  ServeMux                                                    │
+│  ├─ /create /list /get /status /update /delete /run /stop    │
+│  ├─ /files/upload /files/list /files/view                    │
+│  ├─ /files/delete /files/save  ──► File Manager (output/)   │
+│  └─ /  ──────────────────────► webhookRouter  O(1) map       │
+│                                  → HTTP 429 if worker busy   │
+├──────────────────────────────────────────────────────────────┤
+│  Runtime  (goroutine per worker, recover() per goroutine)    │
+│  Global semaphore: max 20 concurrent call_api                │
+│  pipelineCtx: goroutine-local, reset each loop               │
+│  Vars snapshot: refreshed each iteration (live update)       │
+├──────────────────────────────────────────────────────────────┤
+│  LogManager  (buffered per-worker log)                       │
+│  log/{workerID}.log — 32 KB buffer, flush setiap 3 detik    │
+│  Lazy open file handle — ditutup saat worker berhenti        │
+├──────────────────────────────────────────────────────────────┤
+│  Store                                                       │
+│  in-memory map + snapshot copy + gob atomic write            │
+│  flush lock released before encode — no contention           │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -323,6 +425,10 @@ All limits are constants at the top of `main.go` — change to suit your needs.
 | `maxSleepMs` | 60 000 | Max sleep duration (60s) |
 | `minLoopIntervalMs` | 200 | Minimum loop interval |
 | `defaultLoopIntervalMs` | 500 | Default loop interval |
+| `maxUploadBytes` | 10 MB | Max file size for `/files/upload` |
+| `maxSaveBytes` | 5 MB | Max content size for `/files/save` |
+| `maxOutputFiles` | 200 | Max files in `output/` folder |
+| `jumpLimit` | 1 000 | Max branch/next jumps per run |
 
 ---
 
@@ -350,6 +456,11 @@ Minimum: 200ms. Default: 500ms. Set to `0` to use the default.
 | `DELETE` | `/delete?id=<id>` | Delete permanently |
 | `POST` | `/run?id=<id>` | Start a stopped worker |
 | `POST` | `/stop?id=<id>` | Stop a running worker |
+| `POST` | `/files/upload` | Upload file ke `output/` (multipart/form-data) |
+| `GET` | `/files/list` | List semua file di `output/` |
+| `GET` | `/files/view?name=<f>` | Download / tampilkan file |
+| `DELETE` | `/files/delete?name=<f>` | Hapus file dari `output/` |
+| `POST` | `/files/save` | Simpan output agent dengan nama auto-generated |
 | `ANY` | `/<workerID><path>` | Trigger a webhook step |
 
 All `POST`/`PUT` management endpoints require `Content-Type: application/json`.
@@ -394,10 +505,11 @@ POST /create
 ## 🛡️ Reliability & Isolation
 
 - **Panic recovery** — each worker goroutine has `recover()`. A panic sets `running: false`, stores the error in `/status`, and frees the slot. Other workers are unaffected.
-- **Graceful shutdown** — `SIGTERM`/`Ctrl+C` stops all workers, flushes the store, then exits cleanly.
+- **Graceful shutdown** — `SIGTERM`/`Ctrl+C` stops all workers, flushes the store and all log files, then exits cleanly.
 - **Staggered boot** — workers with `running: true` start with a random 10–50ms × index delay to prevent thundering herd on external APIs.
 - **Live vars** — vars are read from the store at each loop iteration, so you can update vars via `/update` without restarting the worker.
 - **Crash-safe storage** — `CreateTemp → fsync → Rename` ensures `workers.gob` is never corrupted on crash.
+- **Buffered logs** — `LogManager` keeps a 32 KB buffer per worker and flushes every 3 seconds or on worker stop, minimizing disk I/O.
 
 ---
 
@@ -420,10 +532,14 @@ GOOS=darwin  GOARCH=arm64 go build -o worker-engine main.go
 
 ```
 .
-├── main.go      # entire application — single file, zero dependencies
-├── workers.gob  # persistent store (auto-created on first run)
-├── doc.md       # in-depth technical documentation
-├── curl.md      # curl examples for all endpoints
+├── main.go        # entire application — single file, zero dependencies
+├── workers.gob    # persistent store (auto-created on first run)
+├── log/           # per-worker log files (auto-created)
+│   └── <workerID>.log
+├── output/        # file manager output folder (auto-created)
+│   └── agent-recipe_20260326-143022_a1b2c3d4.json
+├── doc.md         # in-depth technical documentation
+├── curl.md        # curl examples for all endpoints
 └── README.md
 ```
 
@@ -435,6 +551,7 @@ GOOS=darwin  GOARCH=arm64 go build -o worker-engine main.go
 - **`call_api` body is JSON only.** `form-urlencoded` / `multipart` not supported.
 - **Pipeline data is not persistent.** Lost when worker completes or restarts. Only vars and store data persist.
 - **Status data is in-memory.** `run_count`, `last_error`, `last_run_at` reset on server restart.
+- **Log files are local filesystem only.** No HTTP endpoint to read log files — access directly via filesystem.
 - **No authentication** on API endpoints.
 - **Single process** — not designed for distributed deployment.
 

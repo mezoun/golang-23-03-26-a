@@ -18,12 +18,14 @@
 9. [Batas Sistem & Multi-Tenant Safety](#9-batas-sistem--multi-tenant-safety)
 10. [Teknik Efisiensi](#10-teknik-efisiensi)
 11. [API Reference](#11-api-reference)
-12. [Workflow JSON — Semua Variasi](#12-workflow-json--semua-variasi)
-13. [Lifecycle Worker](#13-lifecycle-worker)
-14. [Concurrency & Thread Safety](#14-concurrency--thread-safety)
-15. [Graceful Shutdown](#15-graceful-shutdown)
-16. [Build & Run](#16-build--run)
-17. [Keterbatasan & Catatan](#17-keterbatasan--catatan)
+12. [File Manager](#12-file-manager)
+13. [LogManager — Per-Worker Log](#13-logmanager--per-worker-log)
+14. [Workflow JSON — Semua Variasi](#14-workflow-json--semua-variasi)
+15. [Lifecycle Worker](#15-lifecycle-worker)
+16. [Concurrency & Thread Safety](#16-concurrency--thread-safety)
+17. [Graceful Shutdown](#17-graceful-shutdown)
+18. [Build & Run](#18-build--run)
+19. [Keterbatasan & Catatan](#19-keterbatasan--catatan)
 
 ---
 
@@ -36,7 +38,7 @@ Worker Engine adalah HTTP server yang memungkinkan pendefinisian **workflow** da
 | Fitur | Keterangan |
 |-------|------------|
 | Webhook | Terima HTTP request (GET/POST); body, query params, dan headers masuk pipeline |
-| Log | Cetak ke stdout, mendukung template `{{stepId.field}}` |
+| Log | Tulis ke file log per-worker (`log/{workerID}.log`), mendukung template `{{stepId.field}}` |
 | Call API | Panggil URL eksternal, response masuk pipeline; mendukung retry + backoff |
 | Branch | Routing kondisional — evaluasi berurutan, cocok pertama menang |
 | Sleep | Delay eksplisit hingga 60 detik, cancellable via ctx |
@@ -47,17 +49,21 @@ Worker Engine adalah HTTP server yang memungkinkan pendefinisian **workflow** da
 | Persistent | Worker tersimpan di gob, survive server restart |
 | Status API | `GET /status` — info runtime, run count, last error, tanpa baca log |
 | Isolasi | Panic per-worker di-recover, error tersimpan, slot dibebaskan |
+| File Manager | Upload, list, view, delete, dan auto-save file output agent via `/files/*` |
+| LogManager | Buffer 32 KB per worker, flush background tiap 3 detik, file handle lazy-open |
 
 **Stack:**
 ```
-Language   : Go 1.18+ (standard library only)
-Storage    : encoding/gob + atomic write (CreateTemp → Rename)
-HTTP       : net/http (ServeMux + custom webhookRouter)
-Concurrency: goroutine + context.WithCancel + sync.RWMutex + recover()
-ID Worker  : UUID v4 via crypto/rand
-ID Step    : 8-char hex via crypto/rand
-Template   : custom renderer — zero dependency
-Hashing    : hash/fnv (FNV-64a) untuk step comparison
+Language    : Go 1.18+ (standard library only)
+Storage     : encoding/gob + atomic write (CreateTemp → Rename)
+HTTP        : net/http (ServeMux + custom webhookRouter)
+Concurrency : goroutine + context.WithCancel + sync.RWMutex + recover()
+ID Worker   : UUID v4 via crypto/rand
+ID Step     : 8-char hex via crypto/rand
+Template    : custom renderer — zero dependency
+Hashing     : hash/fnv (FNV-64a) untuk step comparison
+Log         : bufio.Writer 32 KB per worker → log/{workerID}.log
+File output : output/ folder, auto-generated filename untuk agent save
 ```
 
 ---
@@ -69,6 +75,8 @@ Hashing    : hash/fnv (FNV-64a) untuk step comparison
 │                     HTTP Server :8080                        │
 │  ServeMux                                                    │
 │  ├── /create /list /get /status /update /delete /run /stop   │
+│  ├── /files/upload /files/list /files/view                   │
+│  ├── /files/delete /files/save  ──► File Manager (output/)  │
 │  └── /  ──────────────────────► webhookRouter                │
 │                                   map[path → hookEntry]      │
 │                                   HTTP 429 saat worker busy  │
@@ -84,7 +92,13 @@ Hashing    : hash/fnv (FNV-64a) untuk step comparison
 │    call_api(id=ai) → pctx.Steps["ai"] = response            │
 │    sleep           → delay 500ms, cancellable                │
 │    set_var(id=prep)→ pctx.Steps["prep"] = {key: value}       │
-│    log             → renderTemplate("{{ai.result.answer}}")  │
+│    log             → tulis ke log/{workerID}.log             │
+├──────────────────────────────────────────────────────────────┤
+│  LogManager  (buffered per-worker log)                       │
+│  handles map[workerID → *workerLog]                          │
+│  bufio.Writer 32 KB — background flush tiap 3 detik          │
+│  Lazy open: file handle dibuka saat pertama kali Writef()    │
+│  Close: flush + tutup saat worker berhenti                   │
 ├──────────────────────────────────────────────────────────────┤
 │  Store                                                       │
 │  map[id → *Worker]  in-memory  sync.RWMutex                  │
@@ -276,7 +290,7 @@ Step: call_api (id="ai")
   → pctx.Steps["ai"] = {"result":{"response":"..."},"success":true}
 
 Step: log
-  → "AI jawab: {{ai.result.response}}" → "AI jawab: ...resep..."
+  → "AI jawab: {{ai.result.response}}" → tulis ke log/{workerID}.log
 ```
 
 ### Output Mapping (`output` field)
@@ -292,7 +306,7 @@ Step dapat memetakan output ke field baru:
 }
 ```
 
-Setelah `call_api` selesai dan output disimpan, `output` mapping di-render dan **override** entry pipeline untuk step ini. Akibatnya `{{agent.raw_text}}` tersedia untuk step berikutnya, sedangkan `{{agent.result.response}}` tetap tersedia.
+Setelah `call_api` selesai dan output disimpan, `output` mapping di-render dan **override** entry pipeline untuk step ini. Akibatnya `{{agent.raw_text}}` tersedia untuk step berikutnya.
 
 **Aturan penting:** field `output` boleh self-reference (`{{agent.result.response}}` di step `agent`) karena raw response masuk ke pipeline lebih dulu. Yang tidak boleh adalah referensi ke step yang belum dieksekusi.
 
@@ -312,6 +326,8 @@ Jika response **bukan JSON**, fallback:
 {{stepId.raw}}    →  raw string response body
 {{stepId.status}} →  HTTP status code
 ```
+
+Jika retry habis: output berisi `_error` (pesan error) dan `_attempts` (jumlah percobaan).
 
 ### Webhook Auto Fields
 
@@ -444,14 +460,16 @@ defer func() {
         stack := debug.Stack()
         errMsg := fmt.Sprintf("PANIC: %v", r)
         log.Printf("[worker:%s] %s\n%s", workerID, errMsg, stack)
+        globalLog.Writef(workerID, "%s\n%s", errMsg, stack)
         // update status: running=false, last_error=errMsg
         // update store: running=false
         // bebaskan slot dari cancels map
+        globalLog.Close(workerID)
     }
 }()
 ```
 
-Worker yang panic → berhenti bersih, error tersimpan di `/status`, slot dibebaskan. Worker lain tidak terganggu.
+Worker yang panic → berhenti bersih, error tersimpan di `/status`, slot dibebaskan, log file di-flush dan ditutup. Worker lain tidak terganggu.
 
 ### Live Vars Refresh
 
@@ -487,7 +505,7 @@ Saat server start dan ada worker dengan `running: true`:
 
 ```go
 for i, w := range runningWorkers {
-    delay := (10 + rand.Intn(40)) * ms * (i+1)
+    delay := time.Duration(staggerMinMs+mrand.Intn(staggerMaxMs)) * time.Millisecond * time.Duration(i+1)
     time.AfterFunc(delay, func() { runtime.Start(w, ...) })
 }
 ```
@@ -501,6 +519,7 @@ Saat worker selesai (mode once atau di-stop):
 2. `updated = now` di store
 3. Entry di `rt.cancels` dihapus
 4. Entry di `rt.statuses` di-update
+5. `globalLog.Close(workerID)` — flush dan tutup file handle log
 
 `/list` dan `/status` selalu mencerminkan state real.
 
@@ -512,18 +531,44 @@ Saat worker selesai (mode once atau di-stop):
 
 ```go
 const (
+    // Multi-tenant
     maxConcurrentWorkers = 50   // max worker aktif bersamaan
     maxStoredWorkers     = 500  // max worker tersimpan
     maxStepsPerWorker    = 100  // max steps per worker
     maxConcurrentCalls   = 20   // max concurrent call_api
     maxVarsBuckets       = 20   // max bucket di vars
     maxVarsPerBucket     = 50   // max key per bucket
-    maxBodyBytes         = 128 << 10  // 128 KB
-    maxWebhookBytes      = 64 << 10   // 64 KB
-    maxRetryCount        = 5    // max retry call_api
+
+    // Body size
+    maxBodyBytes         = 128 << 10  // 128 KB — /create, /update
+    maxWebhookBytes      = 64 << 10   // 64 KB — webhook body
+
+    // Retry
+    maxRetryCount        = 5
+
+    // Sleep
     maxSleepMs           = 60_000     // 60 detik
-    minLoopIntervalMs    = 200
+
+    // Loop interval
     defaultLoopIntervalMs = 500
+    minLoopIntervalMs     = 200
+
+    // Jump limit per run (proteksi infinite loop)
+    jumpLimit             = 1000
+
+    // File manager
+    maxUploadBytes        = 10 << 20  // 10 MB per file upload
+    maxSaveBytes          = 5 << 20   // 5 MB per /files/save
+    maxOutputFiles        = 200       // max file di folder output/
+    maxListFiles          = 500       // batas iterasi ReadDir
+
+    // LogManager
+    logBufSize            = 32 << 10        // 32 KB buffer per worker
+    logFlushInterval      = 3 * time.Second // interval flush background
+
+    // Staggered start
+    staggerMinMs          = 10
+    staggerMaxMs          = 40
 )
 ```
 
@@ -595,7 +640,8 @@ Satu pool global — semua `call_api` dari semua worker berbagi pool ini. Menceg
 | **recover() per goroutine** | Isolasi panic, tidak ada goroutine leak |
 | **Live vars refresh** | Vars di-copy dari store tiap iterasi — immutable selama run |
 | **Staggered start** | Spread load saat boot — tidak spike serentak |
-| **Loop interval 500ms default** | vs 50ms lama — 10x lebih hemat scheduler wakeup |
+| **LogManager bufio** | 32 KB buffer per worker — satu flush per 3 detik vs satu write per log |
+| **Lazy log open** | File handle log baru dibuka saat pertama kali dibutuhkan |
 | **Zero external dep** | stdlib only — no CVE, no version conflict |
 
 ---
@@ -614,6 +660,11 @@ Satu pool global — semua `call_api` dari semua worker berbagi pool ini. Menceg
 | DELETE | `/delete?id=<id>` | Hapus worker |
 | POST | `/run?id=<id>` | Jalankan worker |
 | POST | `/stop?id=<id>` | Hentikan worker |
+| POST | `/files/upload` | Upload file ke `output/` |
+| GET | `/files/list` | List semua file di `output/` |
+| GET | `/files/view?name=<f>` | Download / tampilkan file |
+| DELETE | `/files/delete?name=<f>` | Hapus file dari `output/` |
+| POST | `/files/save` | Simpan output agent dengan nama auto-generated |
 | ANY | `/<workerID><path>` | Trigger webhook step |
 
 ### Worker Object
@@ -667,15 +718,198 @@ Data in-memory — reset saat server restart.
 | HTTP | Kondisi |
 |------|---------|
 | 400 | JSON invalid, duplicate step ID, validasi gagal |
-| 404 | Worker tidak ditemukan |
+| 404 | Worker / file tidak ditemukan |
 | 405 | Method salah |
+| 413 | File terlalu besar (upload > 10 MB, save > 5 MB) |
 | 415 | Content-Type bukan application/json |
 | 429 | Webhook: worker busy |
 | 503 | Limit concurrent atau stored tercapai |
+| 507 | Folder output penuh (> 200 file) |
 
 ---
 
-## 12. Workflow JSON — Semua Variasi
+## 12. File Manager
+
+File Manager menyediakan pengelolaan file output berbasis HTTP. Semua file disimpan di folder `output/` yang dibuat otomatis saat pertama kali digunakan.
+
+### Endpoints
+
+#### `POST /files/upload`
+
+Upload file via `multipart/form-data`. Field name wajib: `file`. Maksimum 10 MB per file.
+
+- Melakukan path sanitization — mencegah directory traversal
+- Cek kuota sebelum simpan (`maxOutputFiles = 200`)
+- Response HTTP 201: `{"name":"...", "size_bytes":..., "path":"output/..."}`
+
+#### `GET /files/list`
+
+Kembalikan array JSON semua file di `output/`. Setiap entry:
+
+```json
+{ "name": "report.json", "size_bytes": 2048, "modified": "2026-03-26T14:30:00Z" }
+```
+
+Batas iterasi: `maxListFiles = 500`. Subdirektori diabaikan.
+
+#### `GET /files/view?name=<filename>`
+
+Mengirim file sebagai attachment (`Content-Disposition: attachment`). Cocok untuk download langsung:
+
+```bash
+curl -O -J "http://localhost:8080/files/view?name=report.json"
+```
+
+#### `DELETE /files/delete?name=<filename>`
+
+Menghapus file dari `output/`. Method DELETE wajib.
+
+```bash
+curl -X DELETE "http://localhost:8080/files/delete?name=report.json"
+```
+
+Response: `{"deleted": "report.json"}`
+
+#### `POST /files/save`
+
+Endpoint khusus untuk dipanggil dari dalam pipeline worker via step `call_api`. Menerima JSON body:
+
+```json
+{ "tag": "recipe", "content": "{\"title\":\"Rendang\",...}" }
+```
+
+| Field | Tipe | Keterangan |
+|-------|------|-----------|
+| `tag` | string | Opsional. Label yang muncul di nama file. Hanya huruf, angka, dash. Maks 32 karakter. |
+| `content` | string | Wajib. Isi file yang akan disimpan. Maks 5 MB. |
+
+**Naming convention file:**
+
+```
+tag tidak kosong : agent-{tag}_{YYYYMMDD-HHMMSS}_{rand8hex}.json
+tag kosong       : agent_{YYYYMMDD-HHMMSS}_{rand8hex}.json
+```
+
+Contoh: `agent-recipe_20260326-143022_a1b2c3d4.json`
+
+Response HTTP 201:
+
+```json
+{
+  "name":       "agent-recipe_20260326-143022_a1b2c3d4.json",
+  "size_bytes": 3821,
+  "view_url":   "/files/view?name=agent-recipe_20260326-143022_a1b2c3d4.json"
+}
+```
+
+### Penggunaan dalam Pipeline
+
+Dari dalam step `call_api` di pipeline worker:
+
+```json
+{
+  "id":   "save_file",
+  "type": "call_api",
+  "value": {
+    "method":  "POST",
+    "url":     "http://localhost:8080/files/save",
+    "headers": { "Content-Type": "application/json" },
+    "body": {
+      "tag":     "result",
+      "content": "{{json:prev_step.result.response}}"
+    },
+    "retry": { "max": 2, "delay_ms": 500, "backoff": false }
+  }
+}
+```
+
+Akses `view_url` di step berikutnya: `{{save_file.result.response}}`  
+(karena `/files/save` me-return JSON, field `view_url` tersedia via pipeline)
+
+### Keamanan Path
+
+Semua filename di-sanitize via `filepath.Base(filepath.Clean(name))`. Nama dengan karakter `/`, `\`, atau nama `.` / `..` ditolak dengan HTTP 400.
+
+---
+
+## 13. LogManager — Per-Worker Log
+
+### Arsitektur
+
+```go
+type workerLog struct {
+    mu sync.Mutex
+    f  *os.File
+    bw *bufio.Writer  // 32 KB buffer
+}
+
+type LogManager struct {
+    mu      sync.RWMutex
+    handles map[string]*workerLog  // workerID → file handle
+    done    chan struct{}
+    wg      sync.WaitGroup
+}
+```
+
+### Cara Kerja
+
+**Lazy open:** File handle dibuka pertama kali `Writef()` dipanggil untuk worker tersebut. Tidak ada file yang dibuat untuk worker yang tidak pernah menulis log.
+
+**Path log:** `log/{workerID}.log`  
+Folder `log/` dibuat otomatis saat `newLogManager()` dipanggil (saat server start).
+
+**Format baris:**
+```
+2026-03-26T14:30:22.123+07:00 [step:s01(s01_webhook)] WEBHOOK triggered
+```
+
+**Buffer & flush:**
+- Buffer 32 KB per worker (`bufio.Writer`)
+- Background goroutine flush semua handle setiap 3 detik
+- Flush + tutup file saat worker berhenti (`globalLog.Close(workerID)`)
+- Flush + tutup semua file saat server shutdown (`globalLog.Shutdown()`)
+
+### API LogManager
+
+```go
+// Tulis satu baris log — thread-safe
+globalLog.Writef(workerID, "[step:%s] %s", stepLabel, message)
+
+// Flush + tutup file handle — dipanggil saat worker berhenti
+globalLog.Close(workerID)
+
+// Flush + tutup semua handle — dipanggil saat server shutdown
+globalLog.Shutdown()
+```
+
+### Contoh Isi File Log
+
+```
+2026-03-26T14:30:22.001+07:00 [step:-] WEBHOOK registered POST /recipe-agent-v1/recipe
+2026-03-26T14:30:22.500+07:00 [step:01 – Receive Input(s01_webhook)] WEBHOOK triggered
+2026-03-26T14:30:23.100+07:00 [step:02 – Input Classification(s02_detect)] CALL_API POST https://... → HTTP 200
+2026-03-26T14:30:24.000+07:00 [step:03 – Route(s03_branch_type)] BRANCH → no case matched — sequential
+2026-03-26T14:30:25.800+07:00 workflow completed
+```
+
+### Akses Log
+
+File log hanya tersedia melalui filesystem — tidak ada HTTP endpoint untuk membacanya.
+
+```bash
+# Ikuti log secara real-time
+tail -f log/recipe-agent-v1.log
+
+# Cari error
+grep "PANIC\|_error\|ERROR" log/recipe-agent-v1.log
+
+# Log beberapa hari terakhir
+ls -lt log/
+```
+
+---
+
+## 14. Workflow JSON — Semua Variasi
 
 ### Webhook step
 
@@ -798,6 +1032,26 @@ Akses selanjutnya: `{{prep.full_prompt}}`
 
 Setelah `step_a` selesai, lompat langsung ke `merge_step` — mengabaikan step di antaranya.
 
+### Save ke File Manager (dari pipeline)
+
+```json
+{
+  "id": "simpan",
+  "type": "call_api",
+  "value": {
+    "method":  "POST",
+    "url":     "http://localhost:8080/files/save",
+    "headers": { "Content-Type": "application/json" },
+    "body": {
+      "tag":     "output",
+      "content": "{{json:prev_step.result.response}}"
+    }
+  }
+}
+```
+
+Akses URL file: `{{simpan.result.response}}` (berisi JSON `{"name":"...","view_url":"..."}`)
+
 ### Vars dengan cross-reference
 
 ```json
@@ -815,7 +1069,7 @@ Setelah `step_a` selesai, lompat langsung ke `merge_step` — mengabaikan step d
 
 ---
 
-## 13. Lifecycle Worker
+## 15. Lifecycle Worker
 
 ```
 POST /create
@@ -829,6 +1083,7 @@ POST /create
   [ RUNNING ]  goroutine aktif
       │
       ├── POST /stop ─────────────► running: false, goroutine exit
+      │                             globalLog.Close(workerID)
       │
       ├── mode=once, complete ────► running: false (auto)
       │                             POST /run untuk ulangi
@@ -840,11 +1095,12 @@ POST /create
                                     running: false (auto)
                                     last_error tersimpan di /status
                                     slot dibebaskan
+                                    globalLog.Close(workerID)
 ```
 
 ---
 
-## 14. Concurrency & Thread Safety
+## 16. Concurrency & Thread Safety
 
 | Komponen | Mekanisme | Alasan |
 |----------|-----------|--------|
@@ -861,10 +1117,13 @@ POST /create
 | `pipelineCtx` | goroutine-local | Tidak di-share, tidak perlu lock |
 | `call_api` concurrency | buffered channel semaphore | Max 20 simultan |
 | Panic isolation | `defer recover()` | Per-goroutine, tidak propagate |
+| `LogManager.handles` read | `sync.RWMutex` RLock | Lazy lookup per Writef |
+| `LogManager.handles` write | `sync.RWMutex` Lock | Lazy open & Close |
+| `workerLog.bw` write | `sync.Mutex` | Satu writer per handle |
 
 ---
 
-## 15. Graceful Shutdown
+## 17. Graceful Shutdown
 
 ```go
 sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -878,15 +1137,17 @@ srv.Shutdown(shutdownCtx)
 
 // 3. Trigger final flush store
 store.shutdown()
-time.Sleep(500ms)  // beri waktu flusher selesai
+
+// 4. Flush & tutup semua file handle log worker
+globalLog.Shutdown()
 ```
 
-Urutan penting: worker stop dulu → server stop → store flush.  
-Dengan urutan ini, tidak ada request yang diterima setelah worker berhenti.
+Urutan penting: worker stop dulu → server stop → store flush → log flush.  
+Dengan urutan ini, tidak ada request yang diterima setelah worker berhenti, dan tidak ada log yang hilang.
 
 ---
 
-## 16. Build & Run
+## 18. Build & Run
 
 ```bash
 # Jalankan langsung
@@ -907,18 +1168,22 @@ GOOS=linux   GOARCH=amd64 go build -o worker-engine main.go
 GOOS=darwin  GOARCH=arm64 go build -o worker-engine main.go
 ```
 
-### File runtime
+### File & folder runtime
 
 ```
-workers.gob         ← persistent store (auto-dibuat pada run pertama)
-workers-*.gob.tmp   ← temporary saat write (langsung hilang)
+workers.gob          ← persistent store (auto-dibuat pada run pertama)
+workers-*.gob.tmp    ← temporary saat write (langsung hilang)
+log/                 ← folder log per-worker (auto-dibuat)
+  └─ <workerID>.log  ← satu file per worker, buffered 32 KB
+output/              ← folder file manager (auto-dibuat saat pertama upload/save)
+  └─ agent-recipe_20260326-143022_a1b2c3d4.json
 ```
 
 Port default `:8080` — ubah konstanta `addr` di `main()`.
 
 ---
 
-## 17. Keterbatasan & Catatan
+## 19. Keterbatasan & Catatan
 
 **Webhook menunggu 1 request per step.** Mode `loop` menangani ini otomatis. Jika request datang saat worker masih memproses, server balas HTTP 429 — caller bisa retry.
 
@@ -929,6 +1194,10 @@ Port default `:8080` — ubah konstanta `addr` di `main()`.
 **pipelineCtx tidak persisten.** Data pipeline hilang saat worker selesai atau restart. Hanya vars yang persisten.
 
 **Status tidak persisten.** `run_count`, `last_error`, `last_run_at` di `/status` reset saat server restart.
+
+**Log hanya filesystem.** Tidak ada HTTP endpoint untuk membaca file `log/{workerID}.log`. Akses langsung via filesystem atau tail command.
+
+**File manager tidak punya autentikasi.** Siapapun yang bisa reach port 8080 bisa upload/download/hapus file di `output/`.
 
 **Storage flat file.** Untuk write frequency sangat tinggi, pertimbangkan SQLite atau BoltDB.
 

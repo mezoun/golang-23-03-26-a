@@ -20,3 +20,5 @@ karena saat melakukan save kenapa namanya recipes dan tidak fleksibel,
 buat supaya bisa menyimpan json dalam format json
 markdown dalam format markdown
 plaintext dalam format plaintext
+
+buat supaya log bisa di on off, saat off maka tidak akan ada log sama sekali, default on

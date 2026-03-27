@@ -70,6 +70,9 @@ const (
 	storeFile   = "workers.gob"
 	flushWindow = 300 * time.Millisecond
 
+	// Log folder — per-worker log files
+	logDir = "log"
+
 	// File manager — output folder
 	outputDir      = "output"
 	maxUploadBytes = 10 << 20 // 10 MB per file (multipart upload)
@@ -813,7 +816,7 @@ func runWorker(
 
 		case "log":
 			msg := renderTemplate(step.Value.Message, *pctx, vars)
-			log.Printf("[worker:%s][step:%s] LOG → %s", w.ID, step.stepLabel(), msg)
+			appendWorkerLog(w.ID, fmt.Sprintf("[step:%s] %s", step.stepLabel(), msg))
 			pctx.store(step.ID, map[string]interface{}{"message": msg})
 			if step.parsedOutput != nil {
 				pctx.store(step.ID, renderOutputParsed(step.parsedOutput, *pctx, vars))
@@ -1461,6 +1464,23 @@ type fileInfo struct {
 // ensureOutputDir memastikan folder output ada.
 func ensureOutputDir() error {
 	return os.MkdirAll(outputDir, 0o755)
+}
+
+// appendWorkerLog menulis satu baris log ke file log/{workerID}.log secara append.
+// Operasi ini instant (OS-level file write), tidak ada API call, tidak ada re-render.
+// Format: 2006-01-02T15:04:05.000Z07:00 <message>\n
+func appendWorkerLog(workerID, message string) {
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return
+	}
+	fpath := filepath.Join(logDir, workerID+".log")
+	f, err := os.OpenFile(fpath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	ts := time.Now().Format("2006-01-02T15:04:05.000Z07:00")
+	_, _ = fmt.Fprintf(f, "%s %s\n", ts, message)
+	_ = f.Close()
 }
 
 // safeFilename mencegah path traversal: hanya izinkan nama file tanpa

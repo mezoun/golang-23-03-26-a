@@ -1,29 +1,46 @@
-# Use the official Golang image as a base
-FROM golang:1.25.5 AS builder
+# syntax=docker/dockerfile:1.7
 
-# Set the Current Working Directory inside the container
+############################
+# STAGE 1 — Build
+############################
+FROM golang:1.26-alpine3.23 AS builder
+
 WORKDIR /app
 
-# Copy go.mod and go.sum files
-COPY go.mod .
+# Install minimal tools jika diperlukan
+RUN apk add --no-cache ca-certificates tzdata
 
-# Download all dependencies. Dependencies will be cached if the go.mod and go.sum files are not changed
+# Copy module files first (cache optimization)
+COPY go.mod go.sum* ./
+
+# Download dependencies (cacheable)
 RUN go mod download
 
-# Copy the source code into the container
+# Copy source code
 COPY . .
 
-# Build the Go app
-RUN go build -o main .
+# Build binary (small + static)
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o app .
 
-# Start a new stage from scratch
-FROM alpine:latest
+############################
+# STAGE 2 — Runtime
+############################
+FROM scratch
 
-# Set the Current Working Directory inside the container
-WORKDIR /root/
+WORKDIR /
 
-# Copy the Pre-built binary file from the previous stage
-COPY --from=builder /app/main .
+# copy SSL certs (untuk HTTP client jika diperlukan)
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
-# Command to run the executable
-CMD ["./main"]
+# copy binary
+COPY --from=builder /app/app /app
+
+# expose port
+EXPOSE 8080
+
+# run binary
+ENTRYPOINT ["/app"]

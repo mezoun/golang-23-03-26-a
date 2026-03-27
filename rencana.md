@@ -1,10 +1,22 @@
-agen-resep masih halu, dan masih tidak sesuai, di output hasilnya masih kacau
+buat supaya bisa memanggil function didalam worker
+misalnya funct : <mendeskripsikan function / dependensi> yang dilibatkan didalam worker, misalnya : getTimeNow, atau fungsi yang memanggil hal tertentu tergantung dari inputnya
 
-yang terlibat : curl.md, main.go, recipe-agent.json, './output/agent-recipe_20260327-000312_648c3022.json'
+mungkin itu akan menghemat workflow
+
+---
 
 
-===== [PALING PENTING DAN UTAMA]
-buat seluruh type:log menyimpan log dari worker (di workflow) pada file dengan identify 'id-worker' tersebut dengan metode penyimpanan ke log adalah append, supaya tidak memberatkan sistem untuk save dan upload (replace / re-render), jika append saya kira akan lebih sangat ringan, atau ada opsi yang lebih ringan lainya, silahkan, saya sangat terbuka.
+perbaiki workflow supaya setiap list jika hanya ada 1 maka jangan dibuat menjadi list karena itu akan aneh,
 
-model llm : llama-3.1-70b-instruct, konteks model 24.000, kecepatan 250~450 t/s
-model llm : llama-3.1-8b-instruct-fast, konteks model 128.000, kecepatan 600~2200 t/s
+---
+
+pada workflow sebelum menentukan judul lakukan screening berulang ataupun scoring kecocokan hasil klasifikasi (judul dan sebagainya) dengan permintaan awal pengguna, bahkan jika itu adalah undefined (hal yang tidak akan di proses)
+
+
+----
+
+cek fitur '/save'
+karena saat melakukan save kenapa namanya recipes dan tidak fleksibel,
+buat supaya bisa menyimpan json dalam format json
+markdown dalam format markdown
+plaintext dalam format plaintext

@@ -1,0 +1,826 @@
+{
+  "id": "recipe-agent-v2-md",
+  "name": "Recipe Agent v2 – High Quality Markdown Pipeline",
+  "mode": "loop",
+  "loop_interval_ms": 1000,
+  "running": true,
+  "vars": {
+    "pvt": {
+      "cf_token":   "Bearer cfut_KpdkVf3ZkIArmKDoBLQySa2TA4Pb5MXY4ZkXA7Qbe21abbbf",
+      "cf_url_8b":  "https://api.cloudflare.com/client/v4/accounts/56667d302adadb8e04093b1aac32017c/ai/run/@cf/meta/llama-3.1-8b-instruct-fast",
+      "cf_url_70b": "https://api.cloudflare.com/client/v4/accounts/56667d302adadb8e04093b1aac32017c/ai/run/@cf/meta/llama-3.1-70b-instruct"
+    },
+    "cf": {
+      "token":   "{{pvt.cf_token}}",
+      "url_8b":  "{{pvt.cf_url_8b}}",
+      "url_70b": "{{pvt.cf_url_70b}}"
+    }
+  },
+  "steps": [
+
+    {
+      "id":   "s01_webhook",
+      "name": "01 – Receive Input",
+      "type": "webhook",
+      "value": { "method": "POST", "path": "/recipe-md" }
+    },
+
+    {
+      "id":   "s02_classify",
+      "name": "02 – Classify Input (8b · 64 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_8b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 64,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "Culinary input classifier. Analyze the user input and determine its type. Output ONLY a compact JSON object — no markdown, no extra text: {\"type\":\"title|ingredients|description|combination|unknown\"}. Definitions: title=single dish name only (no ingredient list, no narrative); ingredients=a comma/newline/bullet-separated list of raw ingredients with no dish name; description=a narrative sentence or paragraph describing a dish without listing discrete ingredients; combination=input contains two or more of the above types together; unknown=gibberish, random text, numbers, or content with no plausible culinary interpretation."
+            },
+            {
+              "role":    "user",
+              "content": "{{json:s01_webhook.input}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 300, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s03_guard",
+      "name": "03 – Guard: Skip Pipeline if Unknown Input",
+      "type": "branch",
+      "value": {
+        "cases": [
+          {
+            "when": {
+              "left":  "{{s02_classify.result.response}}",
+              "op":    "contains",
+              "right": "unknown"
+            },
+            "goto": "s99_end"
+          }
+        ]
+      }
+    },
+
+    {
+      "id":   "s04_enrich",
+      "name": "04 – Extract & Enrich Core Fields (70b · culinary expert · 512 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 512,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "You are a culinary expert specializing in Indonesian and Asian cuisine. Given a raw food input and its detected type, extract and infer the three core recipe fields. Rules: (1) Extract faithfully what is present in the input. (2) Infer any missing fields from culinary knowledge — be specific and realistic for Indonesian cuisine. (3) Ingredients must include realistic quantities and units (e.g. '200 g daging ayam', '2 sdm kecap manis'). (4) Title must be the specific dish name. Output ONLY compact JSON — no markdown fences, no preamble, no trailing text: {\"title\":\"nama hidangan yang spesifik dan menarik\",\"description\":\"2-3 kalimat deskriptif dalam Bahasa Indonesia tentang rasa, aroma, tekstur, dan konteks budaya singkat\",\"ingredients\":[\"qty + satuan + nama bahan + catatan detail\"]}"
+            },
+            {
+              "role":    "user",
+              "content": "Input type: {{json:s02_classify.result.response}}\nRaw input: {{json:s01_webhook.input}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s04c_clean",
+      "name": "04c – Strip Markdown · Enrichment (8b · JSON extractor · 512 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_8b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 512,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "JSON extractor. The input may be a raw JSON object, JSON wrapped in markdown code fences (```json...``` or ```...```), or JSON preceded/followed by explanation text. Extract and output ONLY the raw JSON object — no markdown fences, no explanation, no preamble, no trailing text. If the input is already clean JSON, output it unchanged."
+            },
+            {
+              "role":    "user",
+              "content": "{{json:s04_enrich.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 1, "delay_ms": 300, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s05_base_recipe",
+      "name": "05 – Build Full Base Recipe (70b · master chef · 1536 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 1536,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "You are a master chef with 30 years of expertise in Indonesian and Asian cuisine. Using the provided title, description, and ingredient list as foundation, craft a complete, authentic, and highly detailed recipe. Be precise: exact quantities, specific cooking temperatures in Celsius, exact cooking times in minutes, professional technique notes in each step. Output ONLY compact valid JSON — no markdown fences, no extra text, no preamble: {\"title\":\"nama hidangan\",\"description\":\"2-3 kalimat deskriptif dalam Bahasa Indonesia\",\"ingredients\":[\"qty + satuan + nama bahan + catatan jika perlu\"],\"steps\":[\"langkah detail dengan suhu Celsius dan waktu menit yang spesifik jika relevan\"],\"difficulty\":\"easy|medium|hard\",\"equipment\":[\"nama alat masak yang dibutuhkan\"],\"prep_time_min\":0,\"cook_time_min\":0,\"serving_size\":4,\"cuisine_type\":\"nama jenis masakan\",\"meal_type\":\"breakfast|lunch|dinner|snack|dessert\",\"tips\":[\"tip profesional atau rahasia chef\",\"tip kedua\"]}"
+            },
+            {
+              "role":    "user",
+              "content": "{{json:s04c_clean.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s05c_clean",
+      "name": "05c – Strip Markdown · Base Recipe (8b · JSON extractor · 1536 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_8b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 1536,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "JSON extractor. The input may contain JSON wrapped in markdown fences or preceded/followed by text. Extract and output ONLY the raw JSON object — no markdown fences, no preamble, no trailing text. If already clean JSON, output unchanged."
+            },
+            {
+              "role":    "user",
+              "content": "{{json:s05_base_recipe.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 1, "delay_ms": 300, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s06_culture",
+      "name": "06 – Cultural & Health Analysis (70b · anthropologist · 512 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 512,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "You are a culinary anthropologist and registered nutritionist specializing in Indonesian cuisine and culture. Analyze the provided recipe for cultural authenticity and health properties. Output ONLY compact JSON — no markdown: {\"cultural_notes\":\"konteks budaya dan sejarah dalam Bahasa Indonesia (2-3 kalimat mendalam)\",\"health_notes\":\"analisis kesehatan realistis dalam Bahasa Indonesia\",\"allergens\":[\"gluten|dairy|nut|egg|seafood|soy — hanya yang relevan\"],\"dietary_tags\":[\"halal|vegan|vegetarian|gluten-free|low-carb|high-protein — hanya yang berlaku\"],\"budget\":\"low|medium|high\",\"estimated_cost_idr\":0,\"regional_origin\":\"nama daerah atau provinsi asal yang spesifik\"}"
+            },
+            {
+              "role":    "user",
+              "content": "{{json:s05c_clean.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s06c_clean",
+      "name": "06c – Strip Markdown · Culture (8b · 512 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_8b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 512,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "JSON extractor. Extract and output ONLY the raw JSON object — no markdown fences, no explanation, no preamble. If already clean JSON, output unchanged."
+            },
+            {
+              "role":    "user",
+              "content": "{{json:s06_culture.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 1, "delay_ms": 300, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s07_sensory",
+      "name": "07 – Sensory Profile (70b · food stylist · 512 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 512,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "You are a professional food stylist and certified sensory evaluation expert with deep expertise in Indonesian cuisine. Describe this dish's sensory qualities with vivid, precise, and evocative language. Output ONLY compact JSON — no markdown: {\"aroma\":\"deskripsi aroma yang vivid dan spesifik\",\"texture\":\"deskripsi tekstur yang detail\",\"taste_profile\":\"profil rasa lengkap: manis/asin/asam/pedas/gurih/pahit dan interaksinya\",\"color_appearance\":\"deskripsi warna dan penampilan visual yang menarik\",\"plating_suggestion\":\"saran plating profesional yang realistis\",\"garnish\":[\"garnish spesifik 1\",\"garnish spesifik 2\"],\"serving_temperature\":\"suhu saji ideal dengan alasan\",\"mouthfeel\":\"sensasi di mulut saat dikunyah dan ditelan\"}"
+            },
+            {
+              "role":    "user",
+              "content": "{{json:s05c_clean.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s07c_clean",
+      "name": "07c – Strip Markdown · Sensory (8b · 512 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_8b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 512,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "JSON extractor. Extract and output ONLY the raw JSON object — no markdown fences, no explanation, no preamble. If already clean JSON, output unchanged."
+            },
+            {
+              "role":    "user",
+              "content": "{{json:s07_sensory.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 1, "delay_ms": 300, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s08_narrative",
+      "name": "08 – Narrative & Story (70b · food writer · 512 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 512,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "Kamu adalah penulis kuliner Indonesia yang hangat, berempati, dan sangat berwawasan tentang budaya dan sejarah. Tulis narasi yang emosional, mendalam, dan bermakna tentang hidangan ini. Output HANYA JSON kompak (tanpa markdown, tanpa penjelasan): {\"story\":\"narasi emosional 80-120 kata dalam Bahasa Indonesia yang personal dan menggugah perasaan\",\"origin\":\"daerah atau negara asal yang spesifik dengan konteks geografis\",\"cultural_significance\":\"makna budaya yang mendalam dalam 1-2 kalimat\",\"best_occasion\":\"momen atau acara spesifik dimana hidangan ini paling bermakna\",\"fun_fact\":\"fakta menarik atau unik yang jarang diketahui umum\",\"chef_secret\":\"rahasia atau teknik khusus dari chef profesional\"}"
+            },
+            {
+              "role":    "user",
+              "content": "{{json:s05c_clean.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s08c_clean",
+      "name": "08c – Strip Markdown · Narrative (8b · 512 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_8b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 512,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "JSON extractor. Extract and output ONLY the raw JSON object — no markdown fences, no explanation, no preamble. If already clean JSON, output unchanged."
+            },
+            {
+              "role":    "user",
+              "content": "{{json:s08_narrative.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 1, "delay_ms": 300, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s09_nutrition",
+      "name": "09 – Nutrition, Variations & Storage (8b · 512 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_8b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 512,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "Nutrition and variation specialist for Indonesian cuisine. Estimate realistic per-serving nutrition values and generate exactly 4 practical creative recipe variations relevant to the Indonesian market. Output ONLY compact JSON (no markdown): {\"nutrition\":{\"calories\":0,\"protein_g\":0,\"fat_g\":0,\"carbs_g\":0,\"fiber_g\":0,\"sodium_mg\":0},\"variations\":[\"Versi vegan: ganti protein hewani dengan tempe atau tahu\",\"Versi hemat: kurangi bahan mahal, ganti dengan alternatif lokal terjangkau\",\"Versi pedas: tambahkan cabai rawit untuk sensasi panas maksimal\",\"Versi festive: tambahkan bahan premium untuk sajian acara spesial\"],\"plating_tips\":[\"tip plating spesifik 1\",\"tip plating spesifik 2\",\"tip plating spesifik 3\"],\"storage_tips\":\"cara menyimpan yang benar agar tahan lama\",\"shelf_life_hours\":0,\"reheating_tips\":\"cara menghangatkan kembali dengan hasil optimal\"}"
+            },
+            {
+              "role":    "user",
+              "content": "{{json:s05c_clean.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 500, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s10_critics",
+      "name": "10 – Quality Critics 7D (8b · strict · 512 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_8b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 512,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "You are a strict culinary quality critic specializing in Indonesian cuisine. Score this recipe holistically across exactly 7 dimensions (0.0 to 10.0 each, one decimal place). Compute the arithmetic average. Set quality_ok=true ONLY if average >= 8.5. Be honest and strict — do not inflate scores. Scoring dimensions: fact (ingredient accuracy, culinary correctness, realistic quantities), realism (step-by-step practicality for an Indonesian home cook, time estimates, tool availability), health (nutritional balance, caloric reasonableness), culture (Indonesian cultural authenticity and regional accuracy), sensory (taste/aroma/texture appeal based on the sensory profile), budget (cost-effectiveness for Indonesian market), meta (overall completeness, internal consistency, all components coherent). Output ONLY compact JSON (no markdown): {\"fact\":0.0,\"realism\":0.0,\"health\":0.0,\"culture\":0.0,\"sensory\":0.0,\"budget\":0.0,\"meta\":0.0,\"average\":0.0,\"quality_ok\":true,\"feedback\":\"specific actionable improvements as concise list — empty string if quality_ok is true\"}"
+            },
+            {
+              "role":    "user",
+              "content": "Base recipe: {{json:s05c_clean.result.response}}\nCulture+Health: {{json:s06c_clean.result.response}}\nSensory: {{json:s07c_clean.result.response}}\nNarrative: {{json:s08c_clean.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 1, "delay_ms": 500, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s11_quality_gate",
+      "name": "11 – Quality Gate Branch",
+      "type": "branch",
+      "value": {
+        "cases": [
+          {
+            "when": {
+              "left":  "{{s10_critics.result.response}}",
+              "op":    "contains",
+              "right": "quality_ok\":false"
+            },
+            "goto": "s12_improve"
+          },
+          {
+            "goto": "s13_md_hero"
+          }
+        ]
+      }
+    },
+
+    {
+      "id":   "s12_improve",
+      "name": "12 – Improve Recipe Based on Critics (70b · creative rewrite · 1536 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 1536,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "You are a master chef and culinary expert. Rewrite and improve the original recipe to address every specific point in the critic feedback. Maintain the same dish concept but enhance accuracy, cultural authenticity, practicality, and culinary correctness. Be precise with quantities, temperatures, and timings. Output ONLY compact valid JSON with exact same structure as the original — no markdown: {\"title\":\"...\",\"description\":\"...\",\"ingredients\":[\"qty + satuan + nama bahan\"],\"steps\":[\"langkah detail dengan suhu dan waktu yang tepat\"],\"difficulty\":\"easy|medium|hard\",\"equipment\":[\"...\"],\"prep_time_min\":0,\"cook_time_min\":0,\"serving_size\":4,\"cuisine_type\":\"...\",\"meal_type\":\"breakfast|lunch|dinner|snack|dessert\",\"tips\":[\"tip profesional 1\",\"tip profesional 2\"]}"
+            },
+            {
+              "role":    "user",
+              "content": "Original recipe: {{json:s05c_clean.result.response}}\nCritic feedback: {{json:s10_critics.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s12c_clean",
+      "name": "12c – Strip Markdown · Improved Recipe (8b · 1536 tok)",
+      "type": "call_api",
+      "next": "s13_md_hero",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_8b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 1536,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "JSON extractor. Extract and output ONLY the raw JSON object — no markdown fences, no explanation, no preamble, no trailing text. If the input is already clean JSON, output it unchanged."
+            },
+            {
+              "role":    "user",
+              "content": "{{json:s12_improve.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 1, "delay_ms": 300, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s13_md_hero",
+      "name": "13 – Markdown: Hero Section · Title, Intro, Info Table (70b · 1024 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 1024,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "You are a professional food writer and markdown specialist. Generate ONLY the hero section of a high-quality recipe markdown document. Output raw markdown text ONLY — absolutely no JSON, no code fences, no preamble, no explanation. The output must start directly with the H1 heading. Include exactly: (1) An H1 heading with a relevant food emoji and the recipe title. (2) A beautiful italic blockquote with a 2-3 sentence evocative and poetic description of the dish in Bahasa Indonesia. (3) A well-formatted markdown table with these exact rows: Jenis Masakan | Asal Daerah | Waktu Persiapan | Waktu Memasak | Total Waktu | Porsi | Tingkat Kesulitan (use ⭐ emoji: 1=mudah, 2=sedang, 3=sulit) | Tipe Hidangan | Estimasi Biaya. If an improved recipe is provided and non-empty, use it as the primary source; otherwise use the base recipe."
+            },
+            {
+              "role":    "user",
+              "content": "Base recipe: {{json:s05c_clean.result.response}}\nImproved recipe (prefer over base if non-empty): {{json:s12c_clean.result.response}}\nCulture data: {{json:s06c_clean.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s14_sleep",
+      "name": "14s – Sleep 300ms (rate-limit buffer between 70b calls)",
+      "type": "sleep",
+      "value": { "sleep_ms": 300 }
+    },
+
+    {
+      "id":   "s15_md_ingredients",
+      "name": "15 – Markdown: Ingredients Section (70b · 1024 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 1024,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "You are a professional food writer and markdown specialist. Generate ONLY the ingredients section of a high-quality recipe markdown document. Output raw markdown ONLY — no JSON, no code fences, no preamble. Start directly with the H2 heading. Include: (1) H2 heading '## 🧂 Bahan-Bahan'. (2) Organize ingredients into logical named subsections using H3 headings that make sense for this specific recipe (e.g. '### Bahan Utama', '### Bumbu Halus', '### Bumbu Tumis', '### Pelengkap & Penyajian') — only include subsections that are genuinely relevant. (3) Each ingredient as a bullet point with precise quantity, unit, and any essential prep note in parentheses. If improved recipe is provided and non-empty, use it as the primary source."
+            },
+            {
+              "role":    "user",
+              "content": "Base recipe: {{json:s05c_clean.result.response}}\nImproved recipe (prefer over base if non-empty): {{json:s12c_clean.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s16_sleep",
+      "name": "16s – Sleep 300ms (rate-limit buffer)",
+      "type": "sleep",
+      "value": { "sleep_ms": 300 }
+    },
+
+    {
+      "id":   "s17_md_steps",
+      "name": "17 – Markdown: Cooking Steps Section (70b · 1536 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 1536,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "You are a professional food writer and markdown specialist. Generate ONLY the cooking steps section of a high-quality recipe markdown document. Output raw markdown ONLY — no JSON, no code fences, no preamble. Start directly with the H2 heading. Include: (1) H2 heading '## 👨‍🍳 Cara Memasak'. (2) Organize steps into meaningful phases using H3 headings with estimated time in parentheses (e.g. '### Persiapan (~15 menit)', '### Memasak (~40 menit)', '### Penyelesaian & Penyajian (~5 menit)'). (3) Each step as a numbered list item with: the specific action, exact temperature in Celsius where relevant (e.g. 'panaskan hingga 180°C'), exact timing in minutes, a visual or sensory cue to know when done (e.g. 'hingga berwarna keemasan dan harum'), and a professional technique note inline where critical. (4) After all steps, add H3 '### ⏱️ Ringkasan Waktu' with a table: Persiapan | Memasak | Total. Use improved recipe if non-empty, else use base recipe."
+            },
+            {
+              "role":    "user",
+              "content": "Base recipe: {{json:s05c_clean.result.response}}\nImproved recipe (prefer over base if non-empty): {{json:s12c_clean.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s18_sleep",
+      "name": "18s – Sleep 300ms (rate-limit buffer)",
+      "type": "sleep",
+      "value": { "sleep_ms": 300 }
+    },
+
+    {
+      "id":   "s19_md_tips",
+      "name": "19 – Markdown: Tips & Equipment Section (70b · 512 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 512,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "You are a professional food writer and markdown specialist. Generate ONLY the tips and equipment sections of a high-quality recipe markdown document. Output raw markdown ONLY — no JSON, no code fences, no preamble. Start directly with the H2 heading. Include: (1) H2 '## 💡 Tips dari Chef' — 4-6 professional tips as bullet points, each starting with a bold keyword (e.g. '- **Pilih daging yang segar:**'). Tips must be specific, actionable, and insightful — avoid generic advice. (2) H2 '## 🔧 Peralatan yang Dibutuhkan' — equipment as bullet points with a brief note on why it matters if the tool plays a critical role. Use improved recipe if non-empty, else use base recipe."
+            },
+            {
+              "role":    "user",
+              "content": "Base recipe: {{json:s05c_clean.result.response}}\nImproved recipe (prefer over base if non-empty): {{json:s12c_clean.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s20_md_sensory",
+      "name": "20 – Markdown: Sensory & Serving Section (70b · 1024 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 1024,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "You are a professional food writer and markdown specialist. Generate ONLY the sensory and serving section of a high-quality recipe markdown document. Output raw markdown ONLY — no JSON, no code fences, no preamble. Start directly with the H2 heading. Include: (1) H2 '## 👁️ Profil Sensorik & Penyajian'. (2) Each sensory dimension as a bold label followed by its vivid description on the same line: **Aroma**, **Tekstur**, **Profil Rasa**, **Penampilan Visual**, **Sensasi di Mulut**, **Suhu Penyajian**. (3) H3 '### 🎨 Saran Plating' — professional plating guidance in 2-3 sentences. (4) H3 '### 🌿 Pilihan Garnish' — garnish options as bullet list with brief usage note for each. Use the sensory data provided as the primary source."
+            },
+            {
+              "role":    "user",
+              "content": "Sensory analysis: {{json:s07c_clean.result.response}}\nBase recipe: {{json:s05c_clean.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s21_sleep",
+      "name": "21s – Sleep 300ms (rate-limit buffer)",
+      "type": "sleep",
+      "value": { "sleep_ms": 300 }
+    },
+
+    {
+      "id":   "s22_md_culture",
+      "name": "22 – Markdown: Cultural Notes & Health Section (70b · 512 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 512,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "You are a professional food writer and markdown specialist. Generate ONLY the cultural notes and health section of a high-quality recipe markdown document. Output raw markdown ONLY — no JSON, no code fences, no preamble. Start directly with the H2 heading. Include: (1) H2 '## 🌿 Catatan Budaya & Sejarah' — rich cultural context, regional origin, and historical background written as fluent Bahasa Indonesia prose (2-3 paragraphs). (2) H2 '## 💚 Catatan Kesehatan' — health notes in Bahasa Indonesia, then dietary tags each formatted as inline code (e.g. `Halal` `Vegetarian`), then a bullet list of allergen warnings prefixed with ⚠️. Use the culture data as primary source."
+            },
+            {
+              "role":    "user",
+              "content": "Culture & health data: {{json:s06c_clean.result.response}}\nBase recipe: {{json:s05c_clean.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s23_md_nutrition",
+      "name": "23 – Markdown: Nutrition Table (8b · 512 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_8b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 512,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "You are a markdown formatter specializing in nutrition tables for recipe documents. Generate ONLY the nutrition information section. Output raw markdown ONLY — no JSON, no code fences, no preamble. Start directly with the H2 heading. Include: (1) H2 '## 📊 Informasi Gizi (per porsi)'. (2) A markdown table with columns: Zat Gizi | Jumlah | Satuan. Rows: Kalori | [value] | kkal, Protein | [value] | g, Lemak Total | [value] | g, Karbohidrat | [value] | g, Serat | [value] | g, Sodium | [value] | mg. (3) An italic disclaimer: *Nilai gizi merupakan estimasi dan dapat bervariasi tergantung merek dan kualitas bahan yang digunakan.*"
+            },
+            {
+              "role":    "user",
+              "content": "Nutrition data: {{json:s09_nutrition.result.response}}\nRecipe reference: {{json:s05c_clean.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 1, "delay_ms": 300, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s24_md_story",
+      "name": "24 – Markdown: Story, Variations & Storage Section (70b · 768 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 768,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "You are a professional food writer and markdown specialist. Generate ONLY the story, variations, and storage section of a high-quality recipe markdown document. Output raw markdown ONLY — no JSON, no code fences, no preamble. Start directly with the H2 heading. Include: (1) H2 '## 📖 Kisah di Balik Resep' — the emotional narrative story as flowing prose paragraphs in Bahasa Indonesia. (2) H3 '### 💎 Fun Fact' — one surprising and specific fact in a blockquote. (3) H3 '### 🔑 Rahasia Chef' — one key chef technique secret. (4) H2 '## 🔄 Variasi Resep' — 4 variations as a numbered list, each with a bold variation name and 1-2 sentence description. (5) H2 '## 📦 Penyimpanan & Pemanasan' — storage tips as bullet points (with shelf life), then reheating instructions as a separate bullet section. Use the narrative and nutrition data provided."
+            },
+            {
+              "role":    "user",
+              "content": "Narrative & story data: {{json:s08c_clean.result.response}}\nVariations & storage data: {{json:s09_nutrition.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 2, "delay_ms": 1000, "backoff": true }
+      }
+    },
+
+    {
+      "id":   "s25_assemble_top",
+      "name": "25 – Assemble: Top Sections via set_var (hero + ingredients + steps + tips)",
+      "type": "set_var",
+      "value": {
+        "set_key":   "doc_top",
+        "set_value": "{{s13_md_hero.result.response}}\n\n{{s15_md_ingredients.result.response}}\n\n{{s17_md_steps.result.response}}\n\n{{s19_md_tips.result.response}}"
+      }
+    },
+
+    {
+      "id":   "s26_assemble_bot",
+      "name": "26 – Assemble: Bottom Sections via set_var (sensory + culture + nutrition + story)",
+      "type": "set_var",
+      "value": {
+        "set_key":   "doc_bot",
+        "set_value": "{{s20_md_sensory.result.response}}\n\n{{s22_md_culture.result.response}}\n\n{{s23_md_nutrition.result.response}}\n\n{{s24_md_story.result.response}}"
+      }
+    },
+
+    {
+      "id":   "s27_assemble_full",
+      "name": "27 – Assemble: Full Markdown Document via set_var",
+      "type": "set_var",
+      "value": {
+        "set_key":   "full_markdown",
+        "set_value": "{{s25_assemble_top.doc_top}}\n\n---\n\n{{s26_assemble_bot.doc_bot}}\n\n---\n\n*Dokumen ini dibuat secara otomatis oleh **Recipe Agent v2 – High Quality Markdown Pipeline**.*"
+      }
+    },
+
+    {
+      "id":   "s28_md_review",
+      "name": "28 – Review Markdown Quality (8b · 512 tok)",
+      "type": "call_api",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_8b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 512,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "You are a strict markdown quality reviewer for recipe documents. Review the provided markdown document and check for these specific issues: (1) Missing required sections: Title (H1), Bahan-Bahan, Cara Memasak, Tips dari Chef, Peralatan, Profil Sensorik, Catatan Budaya, Catatan Kesehatan, Informasi Gizi, Kisah di Balik Resep, Variasi Resep, Penyimpanan. (2) Unreplaced template placeholders in the form {{...}}. (3) Broken markdown tables (misaligned pipes, missing header separators). (4) Sections that are empty or have fewer than 15 words of content. (5) Raw JSON objects bleeding into the markdown document. Set ok=true ONLY if none of these issues are found. Output ONLY compact JSON (no markdown): {\"ok\":true,\"issues\":[\"issue description — be specific about which section and what is wrong\"]}"
+            },
+            {
+              "role":    "user",
+              "content": "{{json:s27_assemble_full.full_markdown}}"
+            }
+          ]
+        },
+        "retry": { "max": 1, "delay_ms": 300, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s29_review_gate",
+      "name": "29 – Review Gate Branch",
+      "type": "branch",
+      "value": {
+        "cases": [
+          {
+            "when": {
+              "left":  "{{s28_md_review.result.response}}",
+              "op":    "contains",
+              "right": "\"ok\":false"
+            },
+            "goto": "s30_md_fix"
+          },
+          {
+            "goto": "s31_save"
+          }
+        ]
+      }
+    },
+
+    {
+      "id":   "s30_md_fix",
+      "name": "30 – Fix Markdown Issues (70b · 2048 tok)",
+      "type": "call_api",
+      "next": "s32_save_fixed",
+      "value": {
+        "method":  "POST",
+        "url":     "{{cf.url_70b}}",
+        "headers": { "Authorization": "{{cf.token}}" },
+        "body": {
+          "max_tokens": 2048,
+          "messages": [
+            {
+              "role":    "system",
+              "content": "You are a markdown document repair specialist for culinary recipe content. Fix the provided markdown document by addressing every listed issue. Rules: (1) Fix any broken markdown syntax (tables, headers, lists). (2) Replace any {{...}} placeholders with contextually appropriate culinary content. (3) Add any missing required sections with proper content — do not leave them empty. (4) Remove any JSON bleed-through and convert to proper markdown prose. (5) Expand any sections shorter than 15 words to meaningful content. (6) Preserve all existing good content — only fix, do not rewrite what is already correct. Output the complete corrected markdown document ONLY — absolutely no JSON, no preamble, no code fences."
+            },
+            {
+              "role":    "user",
+              "content": "Markdown to fix:\n{{json:s27_assemble_full.full_markdown}}\n\nIssues found by reviewer:\n{{json:s28_md_review.result.response}}"
+            }
+          ]
+        },
+        "retry": { "max": 1, "delay_ms": 1000, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s31_save",
+      "name": "31 – Save to File Manager · Normal Path",
+      "type": "call_api",
+      "next": "s33_log",
+      "value": {
+        "method":  "POST",
+        "url":     "http://localhost:8080/files/save",
+        "headers": { "Content-Type": "application/json" },
+        "body": {
+          "tag":     "recipe-md",
+          "content": "{{json:s27_assemble_full.full_markdown}}"
+        },
+        "retry": { "max": 2, "delay_ms": 500, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s32_save_fixed",
+      "name": "32 – Save to File Manager · Fixed Path",
+      "type": "call_api",
+      "next": "s33_log",
+      "value": {
+        "method":  "POST",
+        "url":     "http://localhost:8080/files/save",
+        "headers": { "Content-Type": "application/json" },
+        "body": {
+          "tag":     "recipe-md-fixed",
+          "content": "{{json:s30_md_fix.result.response}}"
+        },
+        "retry": { "max": 2, "delay_ms": 500, "backoff": false }
+      }
+    },
+
+    {
+      "id":   "s33_log",
+      "name": "33 – Log Result (terminal step)",
+      "type": "log",
+      "value": {
+        "message": "RECIPE_MD_DONE | input={{s01_webhook.input}} | type={{s02_classify.result.response}} | critics={{s10_critics.result.response}} | review={{s28_md_review.result.response}} | save_normal={{s31_save.result.response}} | save_fixed={{s32_save_fixed.result.response}}"
+      }
+    },
+
+    {
+      "id":   "s99_end",
+      "name": "99 – Skip: Unknown / Non-Culinary Input",
+      "type": "log",
+      "value": {
+        "message": "RECIPE_MD_SKIPPED | input={{s01_webhook.input}} | classified={{s02_classify.result.response}} | reason=unknown_culinary_input | hint=Mohon masukkan nama hidangan, daftar bahan, atau deskripsi masakan. Contoh: Rendang Sapi — daging sapi, santan, cabai merah, serai"
+      }
+    }
+
+  ]
+}

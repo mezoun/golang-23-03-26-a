@@ -1,0 +1,82 @@
+{
+  "id": "worker-0",
+  "name": "Worker 0",
+  "mode": "loop",
+  "loop_interval_ms": 1000,
+  "running": true,
+  "vars": {
+    "dt": {
+      "bot-token": "8701146630:AAHT-OasTAkQ7-2_xRy-BouxjOMjS0_ND1o",
+      "url_r": "https://api.telegram.org/bot{{dt.bot-token}}/sendMessage"
+    }
+  },
+  "steps": [
+    {
+      "id":   "wh",
+      "type": "webhook",
+      "next": "log-input",
+      "value": { "method": "POST", "path": "/wh" }
+    },
+		{ "id": "log-input", "type": "log", "next": "cmd", "value": { "message": "{{wh.message.text}}" } },
+		{
+			"id": "cmd",
+			"type": "branch",
+			"value": {
+				"cases": [
+					{ "when": { "left": "{{wh.message.text}}", "op": "==", "right": "/start" }, "goto": "r_start" },
+					{ "when": { "left": "{{wh.message.text}}", "op": "==", "right": "/me" },   "goto": "r_me" },
+					{ "goto": "r_none" }
+				]
+			}
+		},
+		{
+      "id":   "r_start",
+      "type": "call_api",
+      "next": "end",
+      "value": {
+        "method":  "POST",
+        "url":     "{{dt.url_r}}",
+        "headers": { "Content-Type": "application/json" },
+        "body": {
+           "chat_id": "{{wh.message.chat.id}}",
+           "text": "Command /start\nHalo\\! Pesan ini menggunakan *Markdown*",
+           "parse_mode": "MarkdownV2"
+         },
+        "retry": { "max": 1, "delay_ms": 500, "backoff": false }
+      }
+    },
+		{
+      "id":   "r_me",
+      "type": "call_api",
+      "next": "end",
+      "value": {
+        "method":  "POST",
+        "url":     "{{dt.url_r}}",
+        "headers": { "Content-Type": "application/json" },
+        "body": {
+           "chat_id": "{{wh.message.chat.id}}",
+           "text": "Id : `{{wh.message.from.id}}`\nUsername : @{{wh.message.from.username}}\nNama : `{{wh.message.from.first_name}} {{wh.message.from.last_name}}`",
+           "parse_mode": "MarkdownV2"
+         },
+        "retry": { "max": 1, "delay_ms": 500, "backoff": false }
+      }
+    },
+		{
+      "id":   "r_none",
+      "type": "call_api",
+      "next": "end",
+      "value": {
+        "method":  "POST",
+        "url":     "{{dt.url_r}}",
+        "headers": { "Content-Type": "application/json" },
+        "body": {
+           "chat_id": "{{wh.message.chat.id}}",
+           "text": "NONE",
+           "parse_mode": "MarkdownV2"
+         },
+        "retry": { "max": 1, "delay_ms": 500, "backoff": false }
+      }
+    },
+		{ "id": "end", "type": "log", "value": { "message": "===END===" } }
+	]
+}

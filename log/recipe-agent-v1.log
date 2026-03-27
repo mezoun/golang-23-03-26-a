@@ -1,0 +1,16 @@
+2026-03-27T21:58:11.186+07:00 [step:14 – Log Result(s14_log)] RECIPE_DONE | input=Kentang, cabai, kecap, asam jawa, sedikit gula jawa, sereh, kencur, burung puyuh, bihun | type={"type":"combination"} | critics_avg= | saved={{s13_save.result.response}}
+2026-03-27T21:58:11.187+07:00 [step:18 – Run Complete (unknown input path)(s18_run_complete)] RUN_SKIPPED | input=Kentang, cabai, kecap, asam jawa, sedikit gula jawa, sereh, kencur, burung puyuh, bihun | reason=unknown_type | classified={"type":"combination"}
+2026-03-27T22:27:42.937+07:00 [step:14 – Log Result (terminal step)(s14_log)] RECIPE_DONE | input=Kentang, cabai, kecap, asam jawa, sedikit gula jawa, sereh, kencur, burung puyuh, bihun | classified={"type":"ingredients"} | critics={"fact":0.0,"realism":0.0,"health":0.0,"culture":0.0,"sensory":0.0,"budget":0.0,"meta":0.0,"average":0.0,"quality_ok":false,"feedback":"- Ingredient list is missing common cooking oil, which is a necessary component in Indonesian cooking. 
+- The recipe assumes the availability of a high-temperature wok or pan, which may not be practical for most home cooks. 
+- The estimated cooking time of 35 minutes is too short for the given steps, which include boiling bihun, cooking the burung puyuh, and simmering the broth. 
+- The recipe does not specify the type of santan (coconut milk) to be used, which can affect the flavor and texture of the dish. 
+- The serving size is listed as 4, but the ingredient quantities are not scaled accordingly. 
+- The recipe does not provide any information on the origin of the burung puyuh, which may be a concern for food safety and sustainability. 
+- The cultural notes provided are inconsistent with the recipe, which claims to be from Betawi, but the ingredients and cooking techniques used are not typical of Betawi cuisine. 
+- The estimated cost of IDR 25,000 is too low for the ingredients listed, especially considering the use of fresh burung puyuh and high-quality santan."} | save_normal= | save_repaired={{s13_save_repaired.result.response}}
+2026-03-27T22:54:18.430+07:00 [step:14 – Log Result (terminal step)(s14_log)] RECIPE_DONE | input=kue kastengle yang enak | classified={"type":"title"} | critics={"fact":2.0,"realism":3.0,"health":1.0,"culture":5.0,"sensory":8.0,"budget":2.0,"meta":2.0,"average":3.4,"quality_ok":false,"feedback":"- Use 250g of all-purpose flour instead of 'tepung terigu', which is a more specific and correct term in Indonesian.
+- Reduce the amount of butter (mentega) to 50g or less to make the kue kastengel healthier.
+- Consider adding more cheese (keju edam) for a stronger flavor.
+- In the 'realism' dimension, consider the availability of cookie cutters and rolling pins in Indonesian households.
+- In the 'health' dimension, note that keju edam is a good source of protein, but also high in saturated fat and cholesterol.
+- In the 'meta' dimension, consider adding more details about the history and cultural significance of kue kastengel in Indonesian cuisine."} | save_normal= | save_repaired={{s13_save_repaired.result.response}}

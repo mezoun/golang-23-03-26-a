@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -86,10 +87,17 @@ const (
 
 	// Jump limit per run (proteksi infinite loop)
 	jumpLimit = 1000
+
+	// LogManager — buffered per-worker log
+	logBufSize       = 32 << 10        // 32 KB buffer per worker
+	logFlushInterval = 3 * time.Second // interval flush background
 )
 
 // Global semaphore untuk concurrent call_api
 var callAPISem = make(chan struct{}, maxConcurrentCalls)
+
+// Global log manager — diinit di main()
+var globalLog *LogManager
 
 // ─────────────────────────────────────────────
 //  Domain types
@@ -423,6 +431,147 @@ func (s *Store) Count() int64 {
 }
 
 // ─────────────────────────────────────────────
+//  LogManager — buffered per-worker log writer
+//  File handle tetap terbuka, bufio 32KB buffer,
+//  background flush tiap 3 detik.
+// ─────────────────────────────────────────────
+
+type workerLog struct {
+	mu sync.Mutex
+	f  *os.File
+	bw *bufio.Writer
+}
+
+type LogManager struct {
+	mu      sync.RWMutex
+	handles map[string]*workerLog
+	done    chan struct{}
+	wg      sync.WaitGroup
+}
+
+func newLogManager() *LogManager {
+	_ = os.MkdirAll(logDir, 0o755) // buat folder sekali saat init
+	lm := &LogManager{
+		handles: make(map[string]*workerLog),
+		done:    make(chan struct{}),
+	}
+	lm.wg.Add(1)
+	go lm.flusher()
+	return lm
+}
+
+func (lm *LogManager) flusher() {
+	defer lm.wg.Done()
+	ticker := time.NewTicker(logFlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-lm.done:
+			lm.flushAll()
+			return
+		case <-ticker.C:
+			lm.flushAll()
+		}
+	}
+}
+
+func (lm *LogManager) flushAll() {
+	lm.mu.RLock()
+	handles := make([]*workerLog, 0, len(lm.handles))
+	for _, wl := range lm.handles {
+		handles = append(handles, wl)
+	}
+	lm.mu.RUnlock()
+	for _, wl := range handles {
+		wl.mu.Lock()
+		if wl.bw != nil {
+			_ = wl.bw.Flush()
+		}
+		wl.mu.Unlock()
+	}
+}
+
+// get membuka file handle untuk workerID bila belum ada (lazy open).
+func (lm *LogManager) get(workerID string) *workerLog {
+	lm.mu.RLock()
+	wl, ok := lm.handles[workerID]
+	lm.mu.RUnlock()
+	if ok {
+		return wl
+	}
+
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	if wl, ok = lm.handles[workerID]; ok {
+		return wl
+	}
+
+	fpath := filepath.Join(logDir, workerID+".log")
+	f, err := os.OpenFile(fpath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil
+	}
+	wl = &workerLog{f: f, bw: bufio.NewWriterSize(f, logBufSize)}
+	lm.handles[workerID] = wl
+	return wl
+}
+
+// Writef menulis satu baris log ke file worker. Thread-safe.
+func (lm *LogManager) Writef(workerID, format string, args ...interface{}) {
+	wl := lm.get(workerID)
+	if wl == nil {
+		return
+	}
+	ts := time.Now().Format("2006-01-02T15:04:05.000Z07:00")
+	msg := fmt.Sprintf(format, args...)
+	wl.mu.Lock()
+	if wl.bw != nil {
+		_, _ = fmt.Fprintf(wl.bw, "%s %s\n", ts, msg)
+	}
+	wl.mu.Unlock()
+}
+
+// Close mem-flush dan menutup file handle worker — dipanggil saat worker berhenti.
+func (lm *LogManager) Close(workerID string) {
+	lm.mu.Lock()
+	wl, ok := lm.handles[workerID]
+	if ok {
+		delete(lm.handles, workerID)
+	}
+	lm.mu.Unlock()
+	if !ok || wl == nil {
+		return
+	}
+	wl.mu.Lock()
+	if wl.bw != nil {
+		_ = wl.bw.Flush()
+	}
+	if wl.f != nil {
+		_ = wl.f.Close()
+	}
+	wl.mu.Unlock()
+}
+
+// Shutdown menutup semua handle — dipanggil saat server shutdown.
+func (lm *LogManager) Shutdown() {
+	close(lm.done)
+	lm.wg.Wait()
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	for id, wl := range lm.handles {
+		wl.mu.Lock()
+		if wl.bw != nil {
+			_ = wl.bw.Flush()
+		}
+		if wl.f != nil {
+			_ = wl.f.Close()
+		}
+		wl.mu.Unlock()
+		delete(lm.handles, id)
+	}
+}
+
+// ─────────────────────────────────────────────
 //  pipelineCtx
 // ─────────────────────────────────────────────
 
@@ -474,7 +623,7 @@ func (wr *webhookRouter) register(path, method, workerID string, arrived chan ma
 	wr.mu.Lock()
 	wr.entries[path] = &hookEntry{method: method, workerID: workerID, arrived: arrived}
 	wr.mu.Unlock()
-	log.Printf("[worker:%s] WEBHOOK registered %s %s", workerID, method, path)
+	globalLog.Writef(workerID, "[step:-] WEBHOOK registered %s %s", method, path)
 }
 
 func (wr *webhookRouter) unregister(path string) {
@@ -500,11 +649,11 @@ func (wr *webhookRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(io.LimitReader(r.Body, maxWebhookBytes))
 
 	if len(body) > 256 {
-		log.Printf("[worker:%s] WEBHOOK %s %s | body: %s... (%d bytes)",
-			entry.workerID, r.Method, r.URL.Path, body[:256], len(body))
+		globalLog.Writef(entry.workerID, "WEBHOOK %s %s | body: %s... (%d bytes)",
+			r.Method, r.URL.Path, body[:256], len(body))
 	} else {
-		log.Printf("[worker:%s] WEBHOOK %s %s | body: %s",
-			entry.workerID, r.Method, r.URL.Path, body)
+		globalLog.Writef(entry.workerID, "WEBHOOK %s %s | body: %s",
+			r.Method, r.URL.Path, body)
 	}
 
 	bodyMap := make(map[string]interface{})
@@ -558,8 +707,8 @@ func (wr *webhookRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusTooManyRequests)
 		fmt.Fprintln(w, `{"error":"worker busy, retry later"}`)
-		log.Printf("[worker:%s] WEBHOOK %s %s DROPPED — worker busy (HTTP 429)",
-			entry.workerID, r.Method, r.URL.Path)
+		globalLog.Writef(entry.workerID, "WEBHOOK %s %s DROPPED — worker busy (HTTP 429)",
+			r.Method, r.URL.Path)
 	}
 }
 
@@ -639,7 +788,8 @@ func (rt *Runtime) Start(w Worker, store *Store, hooks *webhookRouter) {
 			if r := recover(); r != nil {
 				stack := debug.Stack()
 				errMsg := fmt.Sprintf("PANIC: %v", r)
-				log.Printf("[worker:%s] %s\n%s", workerID, errMsg, stack)
+				log.Printf("[worker:%s] %s\n%s", workerID, errMsg, stack) // tetap ke terminal
+				globalLog.Writef(workerID, "%s\n%s", errMsg, stack)
 				rt.updateStatus(workerID, false, errMsg)
 				rt.mu.Lock()
 				rt.statuses[workerID].Running = false
@@ -651,6 +801,7 @@ func (rt *Runtime) Start(w Worker, store *Store, hooks *webhookRouter) {
 					wk.Updated = time.Now()
 					store.Save(&wk)
 				}
+				globalLog.Close(workerID)
 			}
 		}()
 
@@ -686,7 +837,8 @@ func (rt *Runtime) Start(w Worker, store *Store, hooks *webhookRouter) {
 				rt.statuses[workerID].Running = false
 				delete(rt.cancels, workerID)
 				rt.mu.Unlock()
-				log.Printf("[worker:%s] stopped", workerID)
+				globalLog.Writef(workerID, "worker stopped")
+				globalLog.Close(workerID)
 				return
 			default:
 			}
@@ -706,6 +858,8 @@ func (rt *Runtime) Start(w Worker, store *Store, hooks *webhookRouter) {
 					rt.statuses[workerID].Running = false
 					delete(rt.cancels, workerID)
 					rt.mu.Unlock()
+					globalLog.Writef(workerID, "worker stopped (loop)")
+					globalLog.Close(workerID)
 					return
 				case <-timer.C:
 				}
@@ -722,6 +876,7 @@ func (rt *Runtime) Start(w Worker, store *Store, hooks *webhookRouter) {
 			rt.statuses[workerID].Running = false
 			delete(rt.cancels, workerID)
 			rt.mu.Unlock()
+			globalLog.Close(workerID)
 			return
 		}
 	}()
@@ -790,7 +945,7 @@ func runWorker(
 	for i < len(steps) {
 		select {
 		case <-ctx.Done():
-			log.Printf("[worker:%s] stopped mid-run", w.ID)
+			globalLog.Writef(w.ID, "stopped mid-run")
 			return "stopped"
 		default:
 		}
@@ -840,20 +995,21 @@ func runWorker(
 					if jumps > jumpLimit {
 						msg := fmt.Sprintf("[worker:%s][step:%s] BRANCH jump limit (%d) exceeded — aborting run",
 							w.ID, step.stepLabel(), jumpLimit)
-						log.Print(msg)
+						globalLog.Writef(w.ID, "[step:%s] BRANCH jump limit (%d) exceeded — aborting run",
+							step.stepLabel(), jumpLimit)
 						return msg
 					}
 					nextIdx = target
 					jumped = true
-					log.Printf("[worker:%s][step:%s] BRANCH → goto %q (idx %d)",
-						w.ID, step.stepLabel(), gotoID, target)
+					globalLog.Writef(w.ID, "[step:%s] BRANCH → goto %q (idx %d)",
+						step.stepLabel(), gotoID, target)
 				} else {
-					log.Printf("[worker:%s][step:%s] BRANCH goto %q not found — sequential",
-						w.ID, step.stepLabel(), gotoID)
+					globalLog.Writef(w.ID, "[step:%s] BRANCH goto %q not found — sequential",
+						step.stepLabel(), gotoID)
 				}
 			} else {
-				log.Printf("[worker:%s][step:%s] BRANCH → no case matched — sequential",
-					w.ID, step.stepLabel())
+				globalLog.Writef(w.ID, "[step:%s] BRANCH → no case matched — sequential",
+					step.stepLabel())
 			}
 
 		case "sleep":
@@ -870,7 +1026,7 @@ func runWorker(
 			}
 
 		default:
-			log.Printf("[worker:%s][step:%s] unknown type: %q", w.ID, step.stepLabel(), step.Type)
+			globalLog.Writef(w.ID, "[step:%s] unknown type: %q", step.stepLabel(), step.Type)
 		}
 
 		// step.Next override (hanya aktif jika branch belum jump)
@@ -880,19 +1036,20 @@ func runWorker(
 				if jumps > jumpLimit {
 					msg := fmt.Sprintf("[worker:%s][step:%s] NEXT jump limit (%d) exceeded — aborting run",
 						w.ID, step.stepLabel(), jumpLimit)
-					log.Print(msg)
+					globalLog.Writef(w.ID, "[step:%s] NEXT jump limit (%d) exceeded — aborting run",
+						step.stepLabel(), jumpLimit)
 					return msg
 				}
 				nextIdx = target
-				log.Printf("[worker:%s][step:%s] NEXT → goto %q (idx %d)",
-					w.ID, step.stepLabel(), step.Next, target)
+				globalLog.Writef(w.ID, "[step:%s] NEXT → goto %q (idx %d)",
+					step.stepLabel(), step.Next, target)
 			}
 		}
 
 		i = nextIdx
 	}
 
-	log.Printf("[worker:%s] workflow completed", w.ID)
+	globalLog.Writef(w.ID, "workflow completed")
 	return lastErr
 }
 
@@ -906,13 +1063,13 @@ func execBranch(workerID string, step Step, pctx pipelineCtx, vars map[string]ma
 	}
 	for i, c := range step.Value.Cases {
 		if c.When == nil {
-			log.Printf("[worker:%s][step:%s] BRANCH case[%d] else → goto %q",
-				workerID, step.stepLabel(), i, c.Goto)
+			globalLog.Writef(workerID, "[step:%s] BRANCH case[%d] else → goto %q",
+				step.stepLabel(), i, c.Goto)
 			return c.Goto
 		}
 		if evalCondition(c.When, pctx, vars) {
-			log.Printf("[worker:%s][step:%s] BRANCH case[%d] match (%q %s %q) → goto %q",
-				workerID, step.stepLabel(), i,
+			globalLog.Writef(workerID, "[step:%s] BRANCH case[%d] match (%q %s %q) → goto %q",
+				step.stepLabel(), i,
 				renderTemplate(c.When.Left, pctx, vars),
 				c.When.Op,
 				renderTemplate(c.When.Right, pctx, vars),
@@ -996,10 +1153,10 @@ func execWebhook(ctx context.Context, workerID string, step Step, hooks *webhook
 
 	select {
 	case bodyMap := <-arrived:
-		log.Printf("[worker:%s][step:%s] WEBHOOK triggered", workerID, step.stepLabel())
+		globalLog.Writef(workerID, "[step:%s] WEBHOOK triggered", step.stepLabel())
 		return bodyMap
 	case <-ctx.Done():
-		log.Printf("[worker:%s][step:%s] WEBHOOK cancelled", workerID, step.stepLabel())
+		globalLog.Writef(workerID, "[step:%s] WEBHOOK cancelled", step.stepLabel())
 		return map[string]interface{}{}
 	}
 }
@@ -1068,7 +1225,7 @@ func execCallAPI(ctx context.Context, workerID string, step Step, pctx pipelineC
 				return map[string]interface{}{"_error": "cancelled", "_attempts": attempt}
 			case <-time.After(delay):
 			}
-			log.Printf("[worker:%s][step:%s] CALL_API retry %d/%d", workerID, step.stepLabel(), attempt, maxTry-1)
+			globalLog.Writef(workerID, "[step:%s] CALL_API retry %d/%d", step.stepLabel(), attempt, maxTry-1)
 		}
 
 		// Acquire semaphore
@@ -1103,7 +1260,7 @@ func doCallAPI(ctx context.Context, workerID string, step Step, pctx pipelineCtx
 	}
 	req, err := http.NewRequestWithContext(ctx, string(cfg.Method), renderedURL, reqBody)
 	if err != nil {
-		log.Printf("[worker:%s][step:%s] CALL_API build error: %v", workerID, step.stepLabel(), err)
+		globalLog.Writef(workerID, "[step:%s] CALL_API build error: %v", step.stepLabel(), err)
 		return map[string]interface{}{"_error": err.Error(), "_attempts": attempt + 1}, false
 	}
 	if len(cfg.Body) > 0 {
@@ -1115,7 +1272,7 @@ func doCallAPI(ctx context.Context, workerID string, step Step, pctx pipelineCtx
 
 	resp, err := apiClient.Do(req)
 	if err != nil {
-		log.Printf("[worker:%s][step:%s] CALL_API error: %v", workerID, step.stepLabel(), err)
+		globalLog.Writef(workerID, "[step:%s] CALL_API error: %v", step.stepLabel(), err)
 		// Network error → bisa retry
 		return map[string]interface{}{"_error": err.Error(), "_attempts": attempt + 1}, cfg.Retry != nil
 	}
@@ -1124,11 +1281,11 @@ func doCallAPI(ctx context.Context, workerID string, step Step, pctx pipelineCtx
 	respRaw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 
 	if len(respRaw) > 256 {
-		log.Printf("[worker:%s][step:%s] CALL_API %s %s → HTTP %d | %s... (%d bytes)",
-			workerID, step.stepLabel(), cfg.Method, renderedURL, resp.StatusCode, respRaw[:256], len(respRaw))
+		globalLog.Writef(workerID, "[step:%s] CALL_API %s %s → HTTP %d | %s... (%d bytes)",
+			step.stepLabel(), cfg.Method, renderedURL, resp.StatusCode, respRaw[:256], len(respRaw))
 	} else {
-		log.Printf("[worker:%s][step:%s] CALL_API %s %s → HTTP %d | %s",
-			workerID, step.stepLabel(), cfg.Method, renderedURL, resp.StatusCode, respRaw)
+		globalLog.Writef(workerID, "[step:%s] CALL_API %s %s → HTTP %d | %s",
+			step.stepLabel(), cfg.Method, renderedURL, resp.StatusCode, respRaw)
 	}
 
 	// Retry untuk 429 dan 5xx
@@ -1160,11 +1317,11 @@ func execSleep(ctx context.Context, workerID string, step Step, pctx pipelineCtx
 	if ms <= 0 {
 		return
 	}
-	log.Printf("[worker:%s][step:%s] SLEEP %dms", workerID, step.stepLabel(), ms)
+	globalLog.Writef(workerID, "[step:%s] SLEEP %dms", step.stepLabel(), ms)
 	select {
 	case <-time.After(time.Duration(ms) * time.Millisecond):
 	case <-ctx.Done():
-		log.Printf("[worker:%s][step:%s] SLEEP cancelled", workerID, step.stepLabel())
+		globalLog.Writef(workerID, "[step:%s] SLEEP cancelled", step.stepLabel())
 	}
 }
 
@@ -1172,14 +1329,14 @@ func execSleep(ctx context.Context, workerID string, step Step, pctx pipelineCtx
 func execSetVar(workerID string, step Step, pctx *pipelineCtx, vars map[string]map[string]string) {
 	cfg := step.Value
 	if cfg.SetKey == "" {
-		log.Printf("[worker:%s][step:%s] SET_VAR: set_key kosong", workerID, step.stepLabel())
+		globalLog.Writef(workerID, "[step:%s] SET_VAR: set_key kosong", step.stepLabel())
 		return
 	}
 	rendered := renderTemplate(cfg.SetValue, *pctx, vars)
 	pctx.store(step.ID, map[string]interface{}{
 		cfg.SetKey: rendered,
 	})
-	log.Printf("[worker:%s][step:%s] SET_VAR %q = %q", workerID, step.stepLabel(), cfg.SetKey, rendered)
+	globalLog.Writef(workerID, "[step:%s] SET_VAR %q = %q", step.stepLabel(), cfg.SetKey, rendered)
 }
 
 // ─────────────────────────────────────────────
@@ -1466,21 +1623,10 @@ func ensureOutputDir() error {
 	return os.MkdirAll(outputDir, 0o755)
 }
 
-// appendWorkerLog menulis satu baris log ke file log/{workerID}.log secara append.
-// Operasi ini instant (OS-level file write), tidak ada API call, tidak ada re-render.
+// appendWorkerLog menulis satu baris log ke file log/{workerID}.log via LogManager.
 // Format: 2006-01-02T15:04:05.000Z07:00 <message>\n
 func appendWorkerLog(workerID, message string) {
-	if err := os.MkdirAll(logDir, 0o755); err != nil {
-		return
-	}
-	fpath := filepath.Join(logDir, workerID+".log")
-	f, err := os.OpenFile(fpath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return
-	}
-	ts := time.Now().Format("2006-01-02T15:04:05.000Z07:00")
-	_, _ = fmt.Fprintf(f, "%s %s\n", ts, message)
-	_ = f.Close()
+	globalLog.Writef(workerID, "%s", message)
 }
 
 // safeFilename mencegah path traversal: hanya izinkan nama file tanpa
@@ -2025,6 +2171,8 @@ func main() {
 		log.Fatalf("cannot open store: %v", err)
 	}
 
+	globalLog = newLogManager()
+
 	hooks := newWebhookRouter()
 	rt := newRuntime()
 	app := &App{store: store, runtime: rt, hooks: hooks}
@@ -2099,6 +2247,9 @@ func main() {
 
 	// Flush terakhir store — blocking sampai flusher benar-benar selesai
 	store.shutdown()
+
+	// Flush & tutup semua file handle log worker
+	globalLog.Shutdown()
 
 	log.Println("worker-engine exited cleanly")
 }
